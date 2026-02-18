@@ -45,14 +45,13 @@ from qgis.core import (
     QgsProcessingUtils,
     QgsRasterLayer,
     QgsRectangle,
-    QgsLabelBlockingRegion,
+    QgsProcessingFeedback,
     Qgis
 )
 from qgis.PyQt.QtCore import QSize, Qt
 from qgis.PyQt.QtGui import QImage, QPainter
 from qgis.utils import iface
 
-_PLUGIN_DIR = os.path.dirname(__file__)
 
 # ---------------------------------------------------------------------------
 # In-memory tile descriptor
@@ -85,7 +84,7 @@ class _CompletionTracker:
         with self._lock:
             self._remaining -= 1
             remaining = self._remaining
-            print(f"[Tracker] task done, {remaining} remaining")
+            self._log(f"[Tracker] task done, {remaining} remaining")
         if remaining <= 0:
             for cb in self._callbacks:
                 cb()
@@ -124,7 +123,7 @@ class GeoPackageTileWriter:
             cur.execute(pragma)
         self._conn.commit()
         self._create_schema()
-        print(f"[GeoPackageTileWriter] Opened: {self.gpkg_path}")
+        self._log(f"[GeoPackageTileWriter] Opened: {self.gpkg_path}")
 
     def close(self):
         with self._lock:
@@ -132,7 +131,7 @@ class GeoPackageTileWriter:
             if self._conn:
                 self._conn.close()
                 self._conn = None
-        print("[GeoPackageTileWriter] Closed.")
+        self._log("[GeoPackageTileWriter] Closed.")
 
     def _create_schema(self):
         cur = self._conn.cursor()
@@ -177,7 +176,7 @@ class GeoPackageTileWriter:
                 tile_data BLOB NOT NULL,
                 UNIQUE (zoom_level, tile_column, tile_row))""")
         self._conn.commit()
-        print("[GeoPackageTileWriter] Schema ready.")
+        self._log("[GeoPackageTileWriter] Schema ready.")
 
     def populate_metadata(self, zoom_levels, origin_x, origin_y,
                           full_w, full_h,
@@ -223,7 +222,7 @@ class GeoPackageTileWriter:
                  full_w / (mw * self.tile_size),
                  full_h / (mh * self.tile_size)))
         self._conn.commit()
-        print(f"[GeoPackageTileWriter] Metadata for zooms {sorted(zoom_levels)}")
+        self._log(f"[GeoPackageTileWriter] Metadata for zooms {sorted(zoom_levels)}")
 
     def add_tile(self, z: int, x: int, y: int, png_bytes: bytes):
         with self._lock:
@@ -239,7 +238,7 @@ class GeoPackageTileWriter:
             "(zoom_level,tile_column,tile_row,tile_data) VALUES (?,?,?,?)",
             self._buffer)
         self._conn.commit()
-        print(f"[GeoPackageTileWriter] Flushed {len(self._buffer)} tiles.")
+        self._log(f"[GeoPackageTileWriter] Flushed {len(self._buffer)} tiles.")
         self._buffer.clear()
 
 
@@ -376,11 +375,11 @@ class TileExportTask(QgsTask):
 
     def run(self) -> bool:
         rendered = skipped = errors = 0
-        print(f"[TileExportTask] Starting — {len(self.tiles)} tiles assigned.")
+        self._log(f"[TileExportTask] Starting — {len(self.tiles)} tiles assigned.")
 
         for td in self.tiles:
             if self.isCanceled():
-                print("[TileExportTask] Cancelled.")
+                self._log("[TileExportTask] Cancelled.")
                 break
             try:
                 image = self._render_tile(td.extent)
@@ -400,17 +399,17 @@ class TileExportTask(QgsTask):
                 if out_img.save(out_path, "PNG"):
                     rendered += 1
                 else:
-                    print(f"[TileExportTask] save() failed: {out_path}")
+                    self._log(f"[TileExportTask] save() failed: {out_path}")
                     errors += 1
 
             except Exception as exc:
                 errors += 1
                 import traceback
-                print(f"[TileExportTask] ERROR z={td.zoom} x={td.col} "
+                self._log(f"[TileExportTask] ERROR z={td.zoom} x={td.col} "
                       f"y={td.row}: {exc}")
                 traceback.print_exc()
 
-        print(f"[TileExportTask] Done — "
+        self._log(f"[TileExportTask] Done — "
               f"rendered={rendered}, skipped_empty={skipped}, errors={errors}")
         return True
 
@@ -450,7 +449,7 @@ class XYZTileExporter:
 
     def export(self) -> str:
         if not self.tile_index:
-            print("[XYZTileExporter] No tiles to render.")
+            self._log("[XYZTileExporter] No tiles to render.")
             return self.output_dir
 
         zoom_levels = set()
@@ -464,12 +463,12 @@ class XYZTileExporter:
             exp_maxy = max(exp_maxy, td.extent.yMaximum())
 
         total = len(self.tile_index)
-        print(f"[XYZTileExporter] {total} tiles, zooms {sorted(zoom_levels)}")
+        self._log(f"[XYZTileExporter] {total} tiles, zooms {sorted(zoom_levels)}")
 
         # Split into equal slices — avoids the shared-queue drain race
         n = min(self.num_workers, total)
         slices = [self.tile_index[i::n] for i in range(n)]
-        print(f"[XYZTileExporter] {n} workers, "
+        self._log(f"[XYZTileExporter] {n} workers, "
               f"tiles/worker: {[len(s) for s in slices]}")
 
         # Snapshot canvas settings on the main thread (thread-safe)
@@ -501,11 +500,11 @@ class XYZTileExporter:
                 QgsTask eliminates the entire chain of GC / signal-timing bugs
                 that caused the GPKG to be empty.
                 """
-                print("[XYZTileExporter] Packing tiles into GPKG…")
+                self._log("[XYZTileExporter] Packing tiles into GPKG…")
                 packed = 0
                 png_paths = sorted(glob.glob(
                     os.path.join(tiles_dir, "**", "*.png"), recursive=True))
-                print(f"[XYZTileExporter] Found {len(png_paths)} PNGs.")
+                self._log(f"[XYZTileExporter] Found {len(png_paths)} PNGs.")
                 for png_path in png_paths:
                     try:
                         rel = os.path.relpath(png_path, tiles_dir)
@@ -525,15 +524,15 @@ class XYZTileExporter:
                             writer.add_tile(z_int, x_int, y_gpkg, fh.read())
                         packed += 1
                     except Exception as exc:
-                        print(f"[XYZTileExporter] Skipping {png_path}: {exc}")
+                        self._log(f"[XYZTileExporter] Skipping {png_path}: {exc}")
                 writer.close()
-                print(f"[XYZTileExporter] Packed {packed} tiles, GPKG closed.")
+                self._log(f"[XYZTileExporter] Packed {packed} tiles, GPKG closed.")
                 layer = QgsRasterLayer(gpkg_path, "tiles")
                 if layer.isValid():
                     QgsProject.instance().addMapLayer(layer)
-                    print(f"[XYZTileExporter] GPKG loaded: {gpkg_path}")
+                    self._log(f"[XYZTileExporter] GPKG loaded: {gpkg_path}")
                 else:
-                    print(f"[XYZTileExporter] WARNING: cannot load {gpkg_path}")
+                    self._log(f"[XYZTileExporter] WARNING: cannot load {gpkg_path}")
 
             self._tracker = _CompletionTracker(n, _on_renders_done)
             tracker = self._tracker
@@ -547,9 +546,9 @@ class XYZTileExporter:
                 layer = QgsRasterLayer(xml, "tiles")
                 if layer.isValid():
                     QgsProject.instance().addMapLayer(layer)
-                    print("[XYZTileExporter] XML tile layer loaded.")
+                    self._log("[XYZTileExporter] XML tile layer loaded.")
                 else:
-                    print("[XYZTileExporter] WARNING: cannot load XML layer.")
+                    self._log("[XYZTileExporter] WARNING: cannot load XML layer.")
 
             self._tracker = _CompletionTracker(n, _on_renders_done)
             tracker = self._tracker
@@ -571,7 +570,7 @@ class XYZTileExporter:
             task.taskTerminated.connect(tracker.notify)
             self._render_tasks.append(task)   # strong reference
             QgsApplication.taskManager().addTask(task)
-            print(f"[XYZTileExporter] Worker {i} dispatched "
+            self._log(f"[XYZTileExporter] Worker {i} dispatched "
                   f"({len(tile_slice)} tiles)")
 
         return self.output_dir
@@ -611,7 +610,7 @@ class XYZTileExporter:
         xml_path = os.path.join(self.output_dir, "tiles.xml")
         with open(xml_path, "w", encoding="utf-8") as fh:
             fh.write(xml)
-        print(f"[XYZTileExporter] WMS XML: {xml_path}")
+        self._log(f"[XYZTileExporter] WMS XML: {xml_path}")
         return xml_path
 
 
@@ -673,7 +672,7 @@ class TileIndexGenerator:
                         extent=QgsRectangle(minx, miny, maxx, maxy),
                     ))
 
-        print(f"[TileIndexGenerator] {len(tiles)} tiles generated in memory.")
+        self._log(f"[TileIndexGenerator] {len(tiles)} tiles generated in memory.")
         return tiles
 
     def _make_subdir(self, base: str) -> str:
@@ -689,7 +688,7 @@ class TileIndexGenerator:
 # ---------------------------------------------------------------------------
 
 
-class TileExportPipeline:
+class QGIS2RasterTiles:
     """End-to-end pipeline: generate index → dispatch render workers →
     (optionally) pack tiles into a GeoPackage."""
 
@@ -697,14 +696,14 @@ class TileExportPipeline:
                  tile_width: float, tile_height: float,
                  matrix_width: int, matrix_height: int,
                  extent, min_zoom: int, max_zoom: int, output_dir: str,
-                 tile_size: int = 256, cpu_percent: float = 50.0,
-                 pack_to_gpkg: bool = False, render_buffer_px: int = 128,
-                 output_dpi: float = 96.0):
+                 tile_size: int, cpu_percent: float,
+                 pack_to_gpkg: bool, render_buffer_px: int,
+                 output_dpi: float, feedback: QgsProcessingFeedback):
         if not (0 < cpu_percent <= 100):
             raise ValueError("cpu_percent must be in (0, 100]")
         cores = multiprocessing.cpu_count()
         self.num_workers = max(1, round(cores * cpu_percent / 100))
-        print(f"[TileExportPipeline] {self.num_workers} workers "
+        self._log(f"[QGIS2RasterTiles] {self.num_workers} workers "
               f"({cpu_percent:.0f}% of {cores} cores)")
 
         self._gen_kwargs = dict(
@@ -725,12 +724,13 @@ class TileExportPipeline:
         self._mw_z0 = matrix_width
         self._mh_z0 = matrix_height
         self._exporter = None   # strong reference kept here
+        self.feedback = feedback
 
-    def run(self) -> str:
-        print("[TileExportPipeline] Building tile index…")
+    def convert_project_to_vector_tiles(self) -> str:
+        self._log("[QGIS2RasterTiles] Building tile index…")
         gen = TileIndexGenerator(**self._gen_kwargs)
         index = gen.generate_in_memory()
-        print(f"[TileExportPipeline] {len(index)} tiles ready.")
+        self._log(f"[QGIS2RasterTiles] {len(index)} tiles ready.")
 
         self._exporter = XYZTileExporter(
             output_dir=gen.output_dir,
@@ -748,8 +748,18 @@ class TileExportPipeline:
             output_dpi=self.output_dpi,
         )
         result = self._exporter.export()
-        print("[TileExportPipeline] Workers dispatched.")
+        self._log("[QGIS2RasterTiles] Workers dispatched.")
         return result
+
+        
+    def _log(self, message: str):
+        """Log message to feedback or console."""
+        if __name__ != "__console__":
+            self.feedback.pushInfo(message)
+        else:
+            self._log(message)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -769,9 +779,9 @@ class TileExportPipeline:
 _pipeline = None   # assigned below; module-level keeps it alive
 
 if __name__ == "__console__":
-    print("Starting TileExportPipeline…")
+    print("Starting QGIS2RasterTiles…")
 
-    _pipeline = TileExportPipeline(
+    tiles_generator = QGIS2RasterTiles(
         crs_epsg=4326,
         top_left_corner=(-180, 90),
         tile_width=180,
@@ -781,7 +791,7 @@ if __name__ == "__console__":
         extent=iface.mapCanvas().extent(),
         min_zoom=0,
         max_zoom=2,
-        output_dir=r"C:\Users\P0026701\OneDrive - Ness Israel\Desktop\ScratchWorkspace",
+        output_dir=QgsProcessingUtils.tempFolder(),
         tile_size=256,
         cpu_percent=90.0,
         pack_to_gpkg=True,
@@ -789,5 +799,5 @@ if __name__ == "__console__":
         output_dpi=192.0,   # set to 96 for standard displays, 192 for Hi-DPI/Retina
     )
 
-    _out = _pipeline.run()
-    print(f"Output: {_out}")
+    output_path = tiles_generator.convert_project_to_vector_tiles()
+    print(f"Output: {output_path}")

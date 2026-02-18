@@ -1,0 +1,18 @@
+[general]
+name=QGIS2RasterTiles
+qgisMinimumVersion=3.40
+qgisMaximumVersion=4.99
+description=
+version=1.0
+author=Jossef Kanter
+email=jossefkan@gmail.com
+experimental=False
+deprecated=False
+homepage=https://github.com/GallPeters/QGIS2RasterTiles
+repository=https://github.com/GallPeters/QGIS2RasterTiles
+tracker=https://github.com/GallPeters/QGIS2RasterTiles
+tags=cartography, style, styles, tiles, web, webmappings, wms, wmts, sharing , services, service, server
+icon=icon.png
+hasProcessingProvider=yes
+supportsQt6=True
+changelog=

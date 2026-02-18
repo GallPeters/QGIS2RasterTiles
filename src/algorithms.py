@@ -10,10 +10,13 @@ from qgis.core import (
     QgsProcessingParameterFolderDestination,
     QgsCoordinateReferenceSystem,
     QgsProcessingParameterEnum,
+    QgsApplication
 )
 from qgis.utils import iface
-from .QGIS2RasterTiles import TileExportPipeline, _PLUGIN_DIR
+from .QGIS2RasterTiles import QGIS2RasterTiles, _PLUGIN_DIR
 
+
+PLUGIN_DIR = join(QgsApplication.qgisSettingsDirPath(), "python", "plugins", "QGIS2RasterTiles")
 _ICON = QIcon(join(_PLUGIN_DIR, "icon.png"))
 
 
@@ -192,7 +195,7 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
 
     def processAlgorithm(self, parameters, context, feedback):
         """
-        Main processing method. Calls TileExportPipeline from QGIS2RasterTiles.
+        Main processing method. Calls QGIS2RasterTiles from QGIS2RasterTiles.
 
         Args:
             parameters: Dictionary containing parameter values
@@ -215,7 +218,7 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
         output_dir = self.parameterAsString(parameters, self.OUTPUT_DIR, context)
 
         try:
-            pipeline = TileExportPipeline(
+            tiles_generator = QGIS2RasterTiles(
                 crs_epsg=4326,
                 top_left_corner=(-180, 90),
                 tile_width=180,
@@ -231,8 +234,9 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
                 pack_to_gpkg=pack_to_gpkg,
                 render_buffer_px=0,
                 output_dpi=float(output_dpi),
+                feedback=feedback
             )
-            pipeline.run()
+            tiles_generator.run()
             feedback.pushInfo("Raster tiles generation completed successfully")
 
         except (NameError, ValueError, AttributeError, TypeError) as e:
