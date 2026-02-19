@@ -48,7 +48,7 @@ from qgis.core import (
     QgsProcessingFeedback,
     Qgis
 )
-from qgis.PyQt.QtCore import QSize, Qt
+from qgis.PyQt.QtCore import QSize, Qt, QEventLoop
 from qgis.PyQt.QtGui import QImage, QPainter
 from qgis.utils import iface
 
@@ -75,10 +75,18 @@ class _CompletionTracker:
     overrides of that C++ virtual method on QgsTask subclasses.
     """
 
-    def __init__(self, total: int, *callbacks):
+    def __init__(self, total: int, *callbacks,
+                 feedback: "QgsProcessingFeedback | None" = None):
         self._remaining = total
         self._lock = threading.Lock()
         self._callbacks = list(callbacks)
+        self._feedback = feedback
+
+    def _log(self, message: str):
+        if self._feedback is not None:
+            self._feedback.pushInfo(message)
+        else:
+            print(message)
 
     def notify(self):
         with self._lock:
@@ -101,13 +109,21 @@ class GeoPackageTileWriter:
     BATCH_SIZE = 200
 
     def __init__(self, gpkg_path: str, tile_size: int = 256,
-                 crs_epsg: int = 4326):
+                 crs_epsg: int = 4326,
+                 feedback: "QgsProcessingFeedback | None" = None):
         self.gpkg_path = gpkg_path
         self.tile_size = tile_size
         self.crs_epsg = crs_epsg
         self._conn = None
         self._lock = threading.Lock()
         self._buffer = []
+        self._feedback = feedback
+
+    def _log(self, message: str):
+        if self._feedback is not None:
+            self._feedback.pushInfo(message)
+        else:
+            print(message)
 
     def open(self):
         self._conn = sqlite3.connect(self.gpkg_path, check_same_thread=False)
@@ -218,7 +234,8 @@ class GeoPackageTileWriter:
                 "(table_name,zoom_level,matrix_width,matrix_height,"
                 " tile_width,tile_height,pixel_x_size,pixel_y_size) "
                 "VALUES ('tiles',?,?,?,?,?,?,?)",
-                (z, mw, mh, self.tile_size, self.tile_size,
+                (z, mw, mh,
+                 self.tile_size, self.tile_size,
                  full_w / (mw * self.tile_size),
                  full_h / (mh * self.tile_size)))
         self._conn.commit()
@@ -277,7 +294,8 @@ class TileExportTask(QgsTask):
     def __init__(self, tiles: list, output_dir: str,
                  canvas_settings: QgsMapSettings,
                  tile_size: int = 256, render_buffer_px: int = 128,
-                 output_dpi: float = 96.0):
+                 output_dpi: float = 96.0,
+                 feedback: "QgsProcessingFeedback | None" = None):
         super().__init__("Tile Export Worker", QgsTask.CanCancel)
         self.tiles = tiles
         self.output_dir = output_dir
@@ -285,6 +303,13 @@ class TileExportTask(QgsTask):
         self.tile_size = tile_size
         self.render_buffer_px = render_buffer_px
         self.output_dpi = output_dpi
+        self._feedback = feedback
+
+    def _log(self, message: str):
+        if self._feedback is not None:
+            self._feedback.pushInfo(message)
+        else:
+            print(message)
 
     def _render_tile(self, extent: QgsRectangle) -> QImage:
         # 1. Overscan: expand extent to prevent label clipping at tile edges
@@ -320,7 +345,7 @@ class TileExportTask(QgsTask):
         #    We do NOT set scale manually — QgsMapSettings computes it from
         #    extent + output size + DPI.
         src = self.canvas_settings
-        output_dpi = self.output_dpi   # set by caller (GUI param or __console__ default)
+        output_dpi = self.output_dpi * src.devicePixelRatio()   # set by caller (GUI param or __console__ default)
         settings = QgsMapSettings()
         settings.setLayers(src.layers())
         settings.setDestinationCrs(src.destinationCrs())
@@ -343,7 +368,7 @@ class TileExportTask(QgsTask):
         settings.setLabelingEngineSettings(labeling_settings)
         # blocking_region = QgsLabelBlockingRegion(extent_geom)
         # settings.setLabelBlockingRegions([blocking_region])
-        settings.setScaleMethod(Qgis.ScaleCalculationMethod.AtEquator)
+        settings.setScaleMethod(src.scaleMethod())
 
         # 3. Render synchronously — safe from any thread, no event loop
         image = QImage(render_size, render_size,
@@ -429,7 +454,8 @@ class XYZTileExporter:
                  tile_matrix_origin: tuple = (-180.0, 90.0),
                  full_width: float = 360.0, full_height: float = 180.0,
                  matrix_width_z0: int = 2, matrix_height_z0: int = 1,
-                 output_dpi: float = 96.0):
+                 output_dpi: float = 96.0,
+                 feedback: "QgsProcessingFeedback | None" = None):
         self.output_dir = output_dir
         self.tile_index = tile_index
         self.num_workers = num_workers
@@ -443,9 +469,16 @@ class XYZTileExporter:
         self.matrix_width_z0 = matrix_width_z0
         self.matrix_height_z0 = matrix_height_z0
         self.output_dpi = output_dpi
+        self._feedback = feedback
         # Strong references so Qt doesn't GC tasks before they finish
         self._render_tasks = []
         self._tracker = None        # render completion tracker — must outlive all workers
+
+    def _log(self, message: str):
+        if self._feedback is not None:
+            self._feedback.pushInfo(message)
+        else:
+            print(message)
 
     def export(self) -> str:
         if not self.tile_index:
@@ -480,10 +513,17 @@ class XYZTileExporter:
         # ------------------------------------------------------------------
         # Completion callbacks
         # ------------------------------------------------------------------
+        # QEventLoop lets export() block here while still processing Qt events
+        # (including the taskCompleted / taskTerminated signals from workers).
+        # loop.quit() is registered as a second tracker callback so it fires
+        # exactly once after all workers have reported completion/termination.
+        self._wait_loop = QEventLoop()
+
         if self.pack_to_gpkg:
             gpkg_path = os.path.join(self.output_dir, "tiles.gpkg")
             writer = GeoPackageTileWriter(gpkg_path, self.tile_size,
-                                          self.crs_epsg)
+                                          self.crs_epsg,
+                                          feedback=self._feedback)
             writer.open()
             writer.populate_metadata(
                 zoom_levels,
@@ -534,8 +574,9 @@ class XYZTileExporter:
                 else:
                     self._log(f"[XYZTileExporter] WARNING: cannot load {gpkg_path}")
 
-            self._tracker = _CompletionTracker(n, _on_renders_done)
-            tracker = self._tracker
+            self._tracker = _CompletionTracker(
+                n, _on_renders_done, self._wait_loop.quit,
+                feedback=self._feedback)
 
         else:
             xml_path = self._write_tilemapresource(zoom_levels, tiles_dir)
@@ -550,8 +591,9 @@ class XYZTileExporter:
                 else:
                     self._log("[XYZTileExporter] WARNING: cannot load XML layer.")
 
-            self._tracker = _CompletionTracker(n, _on_renders_done)
-            tracker = self._tracker
+            self._tracker = _CompletionTracker(
+                n, _on_renders_done, self._wait_loop.quit,
+                feedback=self._feedback)
 
         # ------------------------------------------------------------------
         # Dispatch render workers
@@ -565,13 +607,21 @@ class XYZTileExporter:
                 tile_size=self.tile_size,
                 render_buffer_px=self.render_buffer_px,
                 output_dpi=self.output_dpi,
+                feedback=self._feedback,
             )
-            task.taskCompleted.connect(tracker.notify)
-            task.taskTerminated.connect(tracker.notify)
+            task.taskCompleted.connect(self._tracker.notify)
+            task.taskTerminated.connect(self._tracker.notify)
             self._render_tasks.append(task)   # strong reference
             QgsApplication.taskManager().addTask(task)
             self._log(f"[XYZTileExporter] Worker {i} dispatched "
                   f"({len(tile_slice)} tiles)")
+
+        # Block until every worker has signalled taskCompleted / taskTerminated.
+        # QEventLoop.exec_() keeps processing Qt events while we wait, so the
+        # task signals are delivered normally — no deadlock.
+        self._log("[XYZTileExporter] Waiting for all workers to finish…")
+        self._wait_loop.exec_()
+        self._log("[XYZTileExporter] All workers finished.")
 
         return self.output_dir
 
@@ -623,24 +673,30 @@ class TileIndexGenerator:
     """Generates TileDescriptor objects for a given tile grid and map extent."""
 
     def __init__(self, crs_epsg: int, top_left_corner: tuple,
-                 tile_width: float, tile_height: float,
+                 tile_dim: float,
                  matrix_width: int, matrix_height: int,
-                 extent, min_zoom: int, max_zoom: int, output_dir: str):
+                 extent, min_zoom: int, max_zoom: int, output_dir: str,
+                 feedback: "QgsProcessingFeedback | None" = None):
         self.crs_epsg = crs_epsg
         self.x0, self.y0 = top_left_corner
-        self.tile_width = tile_width
-        self.tile_height = tile_height
+        self.tile_dim = tile_dim
         self.matrix_width = matrix_width
         self.matrix_height = matrix_height
         self.extent = extent
         self.min_zoom = min_zoom
         self.max_zoom = max_zoom
         self.output_dir = self._make_subdir(output_dir)
+        self._feedback = feedback
+
+    def _log(self, message: str):
+        if self._feedback is not None:
+            self._feedback.pushInfo(message)
+        else:
+            print(message)
 
     def _tile_bounds(self, col, row, zoom):
         sc = 2 ** zoom
-        tw = self.tile_width / sc
-        th = self.tile_height / sc
+        tw = th = self.tile_dim / sc
         minx = self.x0 + col * tw
         maxy = self.y0 - row * th
         return minx, maxy - th, minx + tw, maxy
@@ -654,8 +710,7 @@ class TileIndexGenerator:
 
         for zoom in range(self.min_zoom, self.max_zoom + 1):
             sc = 2 ** zoom
-            tw = self.tile_width / sc
-            th = self.tile_height / sc
+            tw = th = self.tile_dim / sc
             nx = int(self.matrix_width * sc)
             ny = int(self.matrix_height * sc)
 
@@ -693,14 +748,15 @@ class QGIS2RasterTiles:
     (optionally) pack tiles into a GeoPackage."""
 
     def __init__(self, crs_epsg: int, top_left_corner: tuple,
-                 tile_width: float, tile_height: float,
+                 tile_dim: float,
                  matrix_width: int, matrix_height: int,
                  extent, min_zoom: int, max_zoom: int, output_dir: str,
                  tile_size: int, cpu_percent: float,
                  pack_to_gpkg: bool, render_buffer_px: int,
-                 output_dpi: float, feedback: QgsProcessingFeedback):
+                 output_dpi: float, feedback: "QgsProcessingFeedback | None" = None):
         if not (0 < cpu_percent <= 100):
             raise ValueError("cpu_percent must be in (0, 100]")
+        self.feedback = feedback
         cores = multiprocessing.cpu_count()
         self.num_workers = max(1, round(cores * cpu_percent / 100))
         self._log(f"[QGIS2RasterTiles] {self.num_workers} workers "
@@ -708,7 +764,7 @@ class QGIS2RasterTiles:
 
         self._gen_kwargs = dict(
             crs_epsg=crs_epsg, top_left_corner=top_left_corner,
-            tile_width=tile_width, tile_height=tile_height,
+            tile_dim=tile_dim,
             matrix_width=matrix_width, matrix_height=matrix_height,
             extent=extent, min_zoom=min_zoom, max_zoom=max_zoom,
             output_dir=output_dir,
@@ -719,16 +775,15 @@ class QGIS2RasterTiles:
         self.output_dpi = output_dpi
         self._crs_epsg = crs_epsg
         self._origin = top_left_corner
-        self._full_w = tile_width * matrix_width
-        self._full_h = tile_height * matrix_height
+        self._full_w = tile_dim * matrix_width
+        self._full_h = tile_dim * matrix_height
         self._mw_z0 = matrix_width
         self._mh_z0 = matrix_height
         self._exporter = None   # strong reference kept here
-        self.feedback = feedback
 
-    def convert_project_to_vector_tiles(self) -> str:
+    def convert_project_to_raster_tiles(self) -> str:
         self._log("[QGIS2RasterTiles] Building tile index…")
-        gen = TileIndexGenerator(**self._gen_kwargs)
+        gen = TileIndexGenerator(**self._gen_kwargs, feedback=self.feedback)
         index = gen.generate_in_memory()
         self._log(f"[QGIS2RasterTiles] {len(index)} tiles ready.")
 
@@ -746,6 +801,7 @@ class QGIS2RasterTiles:
             matrix_width_z0=self._mw_z0,
             matrix_height_z0=self._mh_z0,
             output_dpi=self.output_dpi,
+            feedback=self.feedback,
         )
         result = self._exporter.export()
         self._log("[QGIS2RasterTiles] Workers dispatched.")
@@ -754,10 +810,10 @@ class QGIS2RasterTiles:
         
     def _log(self, message: str):
         """Log message to feedback or console."""
-        if __name__ != "__console__":
+        if self.feedback is not None:
             self.feedback.pushInfo(message)
         else:
-            self._log(message)
+            print(message)
 
 
 
@@ -784,8 +840,7 @@ if __name__ == "__console__":
     tiles_generator = QGIS2RasterTiles(
         crs_epsg=4326,
         top_left_corner=(-180, 90),
-        tile_width=180,
-        tile_height=180,
+        tile_dim=180,
         matrix_width=2,
         matrix_height=1,
         extent=iface.mapCanvas().extent(),
@@ -796,8 +851,8 @@ if __name__ == "__console__":
         cpu_percent=90.0,
         pack_to_gpkg=True,
         render_buffer_px=0,
-        output_dpi=192.0,   # set to 96 for standard displays, 192 for Hi-DPI/Retina
+        output_dpi=96.0,   # set to 96 for standard displays, 192 for Hi-DPI/Retina
     )
 
-    output_path = tiles_generator.convert_project_to_vector_tiles()
+    output_path = tiles_generator.convert_project_to_raster_tiles()
     print(f"Output: {output_path}")

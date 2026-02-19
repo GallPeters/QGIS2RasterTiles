@@ -1,4 +1,4 @@
-"""QGIS Processing Algorithms for QGIS2VectorTiles plugin."""
+"""QGIS Processing Algorithms for QGIS2RasterTiles plugin."""
 
 from os.path import join
 from qgis.PyQt.QtGui import QIcon
@@ -6,6 +6,7 @@ from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessingAlgorithm,
     QgsProcessingParameterNumber,
+    QgsProject,
     QgsProcessingParameterExtent,
     QgsProcessingParameterFolderDestination,
     QgsCoordinateReferenceSystem,
@@ -13,10 +14,10 @@ from qgis.core import (
     QgsApplication
 )
 from qgis.utils import iface
-from .QGIS2RasterTiles import QGIS2RasterTiles, _PLUGIN_DIR
+from .qgis2rastertiles import QGIS2RasterTiles
 
 
-PLUGIN_DIR = join(QgsApplication.qgisSettingsDirPath(), "python", "plugins", "QGIS2RasterTiles")
+_PLUGIN_DIR = join(QgsApplication.qgisSettingsDirPath(), "python", "plugins", "QGIS2RasterTiles")
 _ICON = QIcon(join(_PLUGIN_DIR, "icon.png"))
 
 
@@ -31,6 +32,11 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
     MIN_ZOOM = "MIN_ZOOM"
     MAX_ZOOM = "MAX_ZOOM"
     EXTENT = "EXTENT"
+    TOP_LEFT_X = "TOP_LEFT_X"
+    TOP_LEFT_Y = "TOP_LEFT_Y"
+    TILE_DIM = "TILE_DIM"
+    MATRIX_WIDTH = "MATRIX_WITH"
+    MATRIX_HEIGHT = "MATRIX_HEIGHT"
     CPU_PERCENT = "CPU_PERCENT"
     OUTPUT_DIR = "OUTPUT_DIR"
     OUTPUT_DPI = "OUTPUT_DPI"
@@ -124,7 +130,7 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
-        # Extent parameter - defaults to current map canvas extent
+        # Extent
         extent_param = QgsProcessingParameterExtent(
             self.EXTENT, self.tr("Tiles Extent"), optional=False
         )
@@ -132,6 +138,52 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
         if iface and iface.mapCanvas():
             extent_param.setDefaultValue(iface.mapCanvas().extent())
         self.addParameter(extent_param)
+
+        project_crs = int(QgsProject.instance().crs().authid().split(':')[-1])
+        # Top left X
+        tl_x_param = QgsProcessingParameterNumber(
+                self.TOP_LEFT_X, self.tr("Top Left X"), optional=False
+            )
+        tl_x_param.setDefaultValue({4326:-180, 3857:-20037508.343}.get(project_crs, 0))
+        self.addParameter(tl_x_param
+
+        )
+
+        # Top left Y
+        tl_y_params = QgsProcessingParameterNumber(
+                self.TOP_LEFT_Y, self.tr("Top Left Y"), optional=False
+            )
+        tl_y_params.setDefaultValue({4326:90, 3857:20037508.343}.get(project_crs, 0))
+        self.addParameter(
+            tl_y_params
+        )
+        
+        # Tile dimention
+        td_param = QgsProcessingParameterNumber(
+                self.TILE_DIM, self.tr("Top Tile Dimention"), optional=False
+            )
+        td_param.setDefaultValue({4326:180.0, 3857:40075016.686}.get(project_crs, 0))
+        self.addParameter(td_param
+
+        )
+
+        # Matrix width
+        mw_param = QgsProcessingParameterNumber(
+                self.MATRIX_WIDTH, self.tr("Matrix Width"), optional=False
+            )
+        mw_param.setDefaultValue({4326:2, 3857:1}.get(project_crs, 1))
+        self.addParameter(mw_param
+
+        )
+
+        # Matrix height
+        mh_param = QgsProcessingParameterNumber(
+                self.MATRIX_HEIGHT, self.tr("Matrix Height"), optional=False
+            )
+        mh_param.setDefaultValue({4326:1, 3857:1}.get(project_crs, 1))
+        self.addParameter(mh_param
+
+        )
 
         # CPU Percent parameter
         self.addParameter(
@@ -151,10 +203,10 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.OUTPUT_DPI,
-                self.tr("Output DPI (96 = standard, 192 = Hi-DPI/Retina)"),
+                self.tr("Output DPI"),
                 type=QgsProcessingParameterNumber.Integer,
                 defaultValue=96,
-                minValue=72,
+                minValue=0,
                 maxValue=600,
             )
         )
@@ -164,7 +216,7 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterEnum(
                 self.PACK_TO_GPKG,
                 self.tr("Output Format"),
-                options=["Directory (XYZ PNGs)", "GeoPackage (.gpkg)"],
+                options=["XYZ Directory", "GeoPackage"],
                 defaultValue=0,
                 optional=False,
             )
@@ -212,6 +264,12 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
         extent = self.parameterAsExtent(
             parameters, self.EXTENT, context, QgsCoordinateReferenceSystem("EPSG:4326")
         )
+        top_left_x = self.parameterAsDouble(parameters, self.TOP_LEFT_X, context)
+        top_left_y = self.parameterAsDouble(parameters, self.TOP_LEFT_Y, context)
+        tile_dim = self.parameterAsDouble(parameters, self.TILE_DIM, context)
+        matrix_width = self.parameterAsDouble(parameters, self.MATRIX_WIDTH, context)
+        matrix_height = self.parameterAsDouble(parameters, self.MATRIX_HEIGHT, context)
+        cpu_percent = self.parameterAsInt(parameters, self.CPU_PERCENT, context)
         cpu_percent = self.parameterAsInt(parameters, self.CPU_PERCENT, context)
         output_dpi = self.parameterAsInt(parameters, self.OUTPUT_DPI, context)
         pack_to_gpkg = bool(self.parameterAsInt(parameters, self.PACK_TO_GPKG, context))
@@ -220,11 +278,10 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
         try:
             tiles_generator = QGIS2RasterTiles(
                 crs_epsg=4326,
-                top_left_corner=(-180, 90),
-                tile_width=180,
-                tile_height=180,
-                matrix_width=2,
-                matrix_height=1,
+                top_left_corner=(top_left_x, top_left_y),
+                tile_dim=tile_dim,
+                matrix_width=matrix_width,
+                matrix_height=matrix_height,
                 extent=extent,
                 min_zoom=min_zoom,
                 max_zoom=max_zoom,
@@ -236,7 +293,7 @@ class QGIS2RasterTilesAlgorithm(QgsProcessingAlgorithm):
                 output_dpi=float(output_dpi),
                 feedback=feedback
             )
-            tiles_generator.run()
+            tiles_generator.convert_project_to_raster_tiles()
             feedback.pushInfo("Raster tiles generation completed successfully")
 
         except (NameError, ValueError, AttributeError, TypeError) as e:
