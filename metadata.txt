@@ -1,18 +1,23 @@
 [general]
-name=QGIS2RasterTiles
-qgisMinimumVersion=3.40
-qgisMaximumVersion=4.99
-description=
-version=1.0
+name=XYZ to GeoPackage Exporter
+qgisMinimumVersion=4.0
+description=Exports raster XYZ tiles to a spec-compliant GeoPackage tile pyramid over EPSG:4326, with multithreaded rendering and empty-tile skipping for large (hundreds of thousands to millions of tiles) exports.
+about=Renders the current map composition across a zoom range and writes a single GeoPackage tile pyramid. Runs from the Processing Toolbox under Tile Export, with progress reporting and cancellation support via QGIS's background task framework. Supports PNG, JPEG, WEBP, JPEG2000, and TIFF tile encoding.
+version=0.1.0
 author=Jossef Kanter
-email=jossefkan@gmail.com
-experimental=False
-deprecated=False
-homepage=https://github.com/GallPeters/QGIS2RasterTiles
-repository=https://github.com/GallPeters/QGIS2RasterTiles
-tracker=https://github.com/GallPeters/QGIS2RasterTiles
-tags=cartography, style, styles, tiles, web, webmappings, wms, wmts, sharing , services, service, server
+email=your-email@example.com
+
+tracker=https://github.com/yourusername/xyz-gpkg-exporter/issues
+repository=https://github.com/yourusername/xyz-gpkg-exporter
+homepage=https://github.com/yourusername/xyz-gpkg-exporter
+
+tags=xyz,tiles,geopackage,gpkg,export,raster,tiling,processing
+
+category=Raster
 icon=icon.png
+
+experimental=True
+deprecated=False
+server=False
+
 hasProcessingProvider=yes
-supportsQt6=True
-changelog=
