@@ -9,10 +9,13 @@ thread, since QgsProcessingAlgRunnerTask dispatches processAlgorithm() to
 a background thread by default - this is what avoids the UI-freezing
 behavior observed with direct Python Console execution.
 """
+from os.path import basename
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.core import (
+    QgsProject,
+    QgsRasterLayer,
     QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsProcessingAlgorithm,
@@ -141,13 +144,12 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException(self.tr("Maximum zoom must be greater than or equal to minimum zoom."))
 
         feedback.pushInfo(
-            self.tr(f"Starting export: zoom {min_zoom}-{max_zoom}, format {tile_format}, dpi {dpi}")
+            self.tr(f"Starting export: zoom {min_zoom}-{max_zoom}, format {tile_format}, dpi {dpi}...")
         )
 
         def progress_callback(done: int, total: int) -> None:
             feedback.setProgress(min(100.0, (float(done) / float(total)) * 100.0))
-            # if done % 50 == 0 or done == total:
-            #     feedback.pushInfo(self.tr(f"Processed {done}/{total} tiles"))
+
 
         try:
             exporter = XyzGpkgExporter(
@@ -163,7 +165,6 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
                 should_cancel=feedback.isCanceled,
             )
             output_path = exporter.export()
-            exporter.add_result_layer()
         except Exception as exc:
             raise QgsProcessingException(str(exc))
 
@@ -171,6 +172,9 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(self.tr("Export cancelled by user."))
         else:
             feedback.pushInfo(self.tr(f"Export finished: {output_path}"))
+            if output_path:
+                output_layer = QgsRasterLayer(output_path, basename(output_path).split('.')[0], 'gdal')
+                QgsProject.instance().addMapLayer(output_layer)
 
         return {self.OUTPUT_DIR: output_path}
 
