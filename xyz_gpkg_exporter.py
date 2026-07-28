@@ -8,14 +8,12 @@ Key correctness guarantees:
   * All tile bounds are derived exclusively from QgsTileMatrix (single
     source of truth) - never from independent zoom/row/col arithmetic -
     to avoid gapless/overlap ("puzzle") tile defects.
-  * @map_scale and @zoom_level are exposed to labels/expressions using an
-    explicit equator-based formula, computed ONCE PER ZOOM LEVEL (not per
-    tile): every tile at a given zoom has an identical extent width on
-    this equirectangular grid, so recomputing per tile was redundant.
-    This makes rule-based symbology, scale-dependent labels, and
-    scale-dependent layer visibility evaluate identically to what the
-    live map canvas would show at an equivalent view - regardless of the
-    project's "scale calculation method" setting.
+  * Per-tile render scale is recomputed fresh from the actual
+    QgsMapSettings extent/output-size/output-dpi used for that tile, using
+    an explicit equator-based formula, so rule-based symbology,
+    scale-dependent labels, and scale-dependent layer visibility evaluate
+    identically to what the live map canvas would show at an equivalent
+    view - regardless of the project's "scale calculation method" setting.
   * The GeoPackage is written without WAL (avoiding tile data being
     stranded in a .gpkg-wal side file that never gets checkpointed into
     the main file), and every diagnostic/error is routed through
@@ -25,14 +23,24 @@ Key correctness guarantees:
     QgsMapRendererCustomPainterJob / provider read paths are not
     guaranteed safe to drive concurrently from multiple threads against
     the same shared QgsMapLayer instances.
-  * On success, the finished GeoPackage's tile table is added back to
-    the current QgsProject as a raster layer.
-  * Recommended usage from a plugin/GUI action is start_xyz_gpkg_export(),
-    which runs the whole export on a QgsTask background thread so the
-    QGIS GUI is never blocked - not during setup, not while a
-    max_cpu_percent=100 render is under way. Progress/log output is
-    deliberately sparse: one line for the estimated tile count up front,
-    then only a final summary - never a per-tile "processed N/M" message.
+  * When several project layers physically live inside the same
+    GeoPackage (e.g. after running QGIS's "Package Layers" tool), the
+    first-time clone/open of each of those layers is serialized per
+    source file (see `_source_lock_key` / `TileRenderer._get_clone_lock`)
+    so that many worker threads never call OGR/SQLite's first connection
+    setup against the same physical .gpkg file at the same instant -
+    that concurrent-first-open race is what previously produced a
+    lock/deadlock that never resolved. This only guards the one-time
+    per-thread clone step, so it does not serialize per-tile rendering.
+  * Label truncation at tile edges is suppressed by building a single
+    QgsLabelingEngineSettings once, on the main thread, from the
+    project's own settings (with UsePartialCandidates forced off) and
+    handing that already-built, immutable-for-our-purposes value object
+    to every tile's QgsMapSettings. It is never (re)constructed on a
+    worker thread, since building label-engine/font-related Qt objects
+    off the main thread is not safe and was the cause of every tile
+    failing (producing a schema-only GeoPackage) when this was
+    previously attempted inside render_tile().
 """
 
 import os
@@ -41,14 +49,12 @@ import sqlite3
 import logging
 import traceback
 import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from qgis.core import (
     Qgis,
-    QgsApplication,
     QgsProject,
     QgsRectangle,
     QgsPointXY,
@@ -57,13 +63,12 @@ from qgis.core import (
     QgsMapSettings,
     QgsMapRendererCustomPainterJob,
     QgsMessageLog,
-    QgsRasterLayer,
-    QgsTask,
     QgsTileMatrix,
     QgsTileXYZ,
     QgsExpressionContext,
     QgsExpressionContextScope,
     QgsExpressionContextUtils,
+    QgsLabelingEngineSettings,
 )
 from qgis.PyQt.QtCore import QSize, QBuffer, QIODevice
 from qgis.PyQt.QtGui import QImage, QPainter, QColor
@@ -74,18 +79,6 @@ METERS_PER_DEGREE_EQUATOR = EARTH_CIRCUMFERENCE_M / 360.0
 INCH_METERS = 0.0254
 QIMAGE_NATIVE_FORMATS = {"PNG", "JPEG", "JPG", "WEBP"}
 LOG_TAG = "XyzGpkgExporter"
-
-# ---------------------------------------------------------------------------
-# Tile matrix scheme (GoogleCRS84Quad) - the single source of truth for the
-# tiling grid. Change these to adapt the exporter to a different CRS/grid;
-# every extent, scale and row/col calculation derives from these values via
-# QgsTileMatrix, never from independent constants scattered through the code.
-# ---------------------------------------------------------------------------
-TILE_MATRIX_CRS_AUTHID = "EPSG:4326"
-TILE_MATRIX_ORIGIN = QgsPointXY(-180.0, 90.0)  # top-left corner of the grid
-TILE_MATRIX_Z0_DIMENSION = 180.0  # side length (map units) of one zoom-0 tile
-TILE_MATRIX_ROOT_WIDTH = 2   # columns at zoom 0
-TILE_MATRIX_ROOT_HEIGHT = 1  # rows at zoom 0
 
 
 class _QgsMessageLogHandler(logging.Handler):
@@ -127,6 +120,28 @@ def _equatorial_scale_denominator(extent_width_degrees: float, output_width_px: 
     if paper_width_m <= 0:
         return 0.0
     return ground_width_m / paper_width_m
+
+
+def _source_lock_key(layer) -> str:
+    """Identify the physical file backing a layer, so that concurrent
+    first-opens of the *same* GeoPackage file (typical after running
+    QGIS's "Package Layers" tool, which puts every project layer into one
+    physical .gpkg) can be serialized against each other without
+    serializing unrelated layers/files.
+
+    GeoPackage/OGR source URIs look like '/path/to/file.gpkg|layername=x';
+    everything after the first '|' is provider metadata, not part of the
+    file path, so it is stripped before using the path as a lock key.
+    """
+    try:
+        provider = layer.dataProvider()
+        uri = provider.dataSourceUri() if provider is not None else layer.source()
+    except Exception:
+        uri = layer.source()
+    path = (uri or "").split("|", 1)[0].strip()
+    if not path:
+        return uri or id(layer).__repr__()
+    return os.path.normcase(os.path.normpath(path))
 
 
 def _compute_worker_count(max_cpu_percent: int) -> int:
@@ -200,11 +215,19 @@ class TileMatrixSet:
 
     def __init__(self, crs: QgsCoordinateReferenceSystem, min_zoom: int, max_zoom: int):
         self._crs = crs
+        self._tile_origin = QgsPointXY(-180.0, 90.0)
+        # z0Dimension is the side length (map units) of ONE root tile at zoom 0,
+        # not a tile count. 180.0 degrees x 2 columns x 1 row = full globe
+        # (-180,-90 : 180,90) at every zoom level, with every tile perfectly
+        # square (strict 1:1 aspect ratio), matching GoogleCRS84Quad.
+        self._z0_dimension = 180.0
+        self._root_matrix_width = 2
+        self._root_matrix_height = 1
         self._matrices: Dict[int, QgsTileMatrix] = {}
         for zoom in range(min_zoom, max_zoom + 1):
             self._matrices[zoom] = QgsTileMatrix.fromCustomDef(
-                zoom, self._crs, TILE_MATRIX_ORIGIN,
-                TILE_MATRIX_Z0_DIMENSION, TILE_MATRIX_ROOT_WIDTH, TILE_MATRIX_ROOT_HEIGHT,
+                zoom, self._crs, self._tile_origin,
+                self._z0_dimension, self._root_matrix_width, self._root_matrix_height,
             )
 
     def matrix(self, zoom: int) -> QgsTileMatrix:
@@ -306,7 +329,6 @@ class GeoPackageWriter:
         self._conn.execute("PRAGMA journal_mode=DELETE")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA temp_store=MEMORY")
-        self._rows_written = 0
         self._init_schema(tile_matrix_set, min_zoom, max_zoom, matrix_set_extent)
 
     def _init_schema(self, tile_matrix_set, min_zoom, max_zoom, matrix_set_extent) -> None:
@@ -434,8 +456,8 @@ class GeoPackageWriter:
         )
         self._conn.commit()
         batch_len = len(self._batch)
-        self._rows_written += batch_len
         self._batch.clear()
+        self._logger.info("GeoPackageWriter: flushed batch of %d tile(s) to disk", batch_len)
 
     def flush(self) -> None:
         with self._lock:
@@ -452,20 +474,15 @@ class GeoPackageWriter:
         except Exception as exc:
             self._logger.warning("GeoPackageWriter: wal_checkpoint failed (likely no WAL active): %s", exc)
         self._conn.commit()
-        # Uses INSERT OR REPLACE, so this count only tracks rows *sent* to
-        # write_tile(), not distinct (zoom,col,row) keys post-dedup; a
-        # SELECT COUNT(*) would be exact but forces a full-table scan on
-        # every export, which is wasted I/O on a large GeoPackage.
-        self._logger.info("GeoPackageWriter: %d tile row(s) written to '%s'", self._rows_written, self._table)
+        row_count = self._conn.execute(f"SELECT COUNT(*) FROM {self._table}").fetchone()[0]
+        self._logger.info("GeoPackageWriter: final tile row count in '%s' = %d", self._table, row_count)
         self._conn.close()
 
 
 class TileRenderer:
     """Renders a single tile from the live QGIS project, rebuilding
-    QgsMapSettings extent/size/dpi per tile. The equator-based scale (and
-    zoom level) exposed to expressions is precomputed once per zoom level
-    in __init__ - not per tile - since every tile at a given zoom has an
-    identical extent width on this equirectangular grid.
+    QgsMapSettings extent/size/dpi per tile and reading back the resulting
+    scale fresh every time (never reusing a stale cross-zoom scale).
 
     Each worker thread gets its own cloned set of layers via thread-local
     storage: QgsMapRendererCustomPainterJob and most data providers are
@@ -482,10 +499,8 @@ class TileRenderer:
         layers: List,
         style_overrides: Dict[str, str],
         expr_context: QgsExpressionContext,
+        labeling_settings: QgsLabelingEngineSettings,
         logger: logging.Logger,
-        tile_matrix_set: "TileMatrixSet",
-        min_zoom: int,
-        max_zoom: int,
     ):
         self._project = project
         self._dpi = dpi
@@ -494,49 +509,73 @@ class TileRenderer:
         self._base_layers = layers
         self._style_overrides = style_overrides
         self._expr_context = expr_context
+        # Built once on the main thread by XyzGpkgExporter and only ever
+        # read (never reconstructed) from worker threads - see module
+        # docstring. Assigning this pre-built value object onto each
+        # tile's QgsMapSettings is cheap and thread-safe.
+        self._labeling_settings = labeling_settings
         self._logger = logger
         self._thread_local = threading.local()
 
-        # map_scale and zoom_level are both zoom-only quantities on this
-        # equirectangular grid (every tile at a given zoom has the same
-        # width in degrees, regardless of row/column), so build one
-        # expression context per zoom level up front - built once here,
-        # single-threaded, before the render pool starts - instead of
-        # rebuilding an identical scope/context for every single tile.
-        self._zoom_contexts: Dict[int, QgsExpressionContext] = {}
-        for zoom in range(min_zoom, max_zoom + 1):
-            matrix_w, _ = tile_matrix_set.matrix_dims(zoom)
-            tile_deg_w = tile_matrix_set.matrix(zoom).extent().width() / matrix_w
-            scale = _equatorial_scale_denominator(tile_deg_w, TILE_SIZE, dpi)
-            scope = QgsExpressionContextScope()
-            scope.setVariable("map_scale", scale, True)
-            scope.setVariable("zoom_level", zoom, True)
-            ctx = QgsExpressionContext(expr_context)
-            ctx.appendScope(scope)
-            self._zoom_contexts[zoom] = ctx
+        # Guards the *registry* of per-source-file locks below (not the
+        # clone itself); building/looking up a lock is effectively
+        # instantaneous, so this never becomes a contention point.
+        self._clone_lock_registry_guard = threading.Lock()
+        self._clone_locks: Dict[str, threading.Lock] = {}
+
+    def _get_clone_lock(self, source_key: str) -> threading.Lock:
+        with self._clone_lock_registry_guard:
+            lock = self._clone_locks.get(source_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._clone_locks[source_key] = lock
+            return lock
 
     def _thread_layers(self) -> List:
         if not hasattr(self._thread_local, "layers"):
             cloned = []
             for lyr in self._base_layers:
-                try:
-                    cloned.append(lyr.clone())
-                except Exception as exc:
-                    self._logger.warning(
-                        "TileRenderer: failed to clone layer '%s' for thread %s, using shared instance (%s)",
-                        lyr.name(), threading.get_ident(), exc,
-                    )
-                    cloned.append(lyr)
+                # Serialize only the first-time clone/open of layers that
+                # share the same physical GeoPackage file. QGIS's
+                # Package Layers tool commonly produces a project where
+                # many/all layers point at one .gpkg; if several worker
+                # threads clone (and thereby open a fresh provider
+                # connection to) that same file at the same instant, OGR's
+                # SQLite backend can hit lock contention that never
+                # resolves and the export hangs forever. Locking here only
+                # affects this one-time per-thread setup step - never the
+                # per-tile render loop - so steady-state throughput is
+                # unaffected. Different source files still clone fully in
+                # parallel, since each gets its own lock.
+                lock = self._get_clone_lock(_source_lock_key(lyr))
+                with lock:
+                    try:
+                        cloned.append(lyr.clone())
+                    except Exception as exc:
+                        self._logger.warning(
+                            "TileRenderer: failed to clone layer '%s' for thread %s, using shared instance (%s)",
+                            lyr.name(), threading.get_ident(), exc,
+                        )
+                        cloned.append(lyr)
             self._thread_local.layers = cloned
         return self._thread_local.layers
 
-    def render_tile(self, extent: QgsRectangle, dest_crs: QgsCoordinateReferenceSystem, zoom: int) -> bytes:
+    def render_tile(self, extent: QgsRectangle, dest_crs: QgsCoordinateReferenceSystem) -> bytes:
         settings = QgsMapSettings()
         settings.setDestinationCrs(dest_crs)
         settings.setLayers(self._thread_layers())
         if self._style_overrides:
             settings.setLayerStyleOverrides(self._style_overrides)
         settings.setBackgroundColor(QColor(0, 0, 0, 0))
+        # Apply the shared, pre-built labeling engine settings (built once,
+        # on the main thread, from the project's own settings with
+        # UsePartialCandidates forced off) to this tile's map settings.
+        # QgsMapSettings does not otherwise inherit the project's labeling
+        # engine settings on its own, so without this, tiles would always
+        # render with default engine settings regardless of the project
+        # configuration - which is why labels were previously able to
+        # cross tile boundaries even though the project-level flag was set.
+        settings.setLabelingEngineSettings(self._labeling_settings)
         settings.setOutputSize(QSize(TILE_SIZE, TILE_SIZE))
         settings.setOutputDpi(self._dpi)
         settings.setExtent(extent)
@@ -544,10 +583,16 @@ class TileRenderer:
         settings.setFlag(QgsMapSettings.Flag.RenderMapTile, True)
         settings.setFlag(QgsMapSettings.Flag.UseAdvancedEffects, True)
 
-        # map_scale/zoom_level: cheap copy (Qt implicit sharing) of the
-        # context built once for this zoom in __init__ - no per-tile scope
-        # construction or scale recomputation.
-        settings.setExpressionContext(QgsExpressionContext(self._zoom_contexts[zoom]))
+        # Equator-based scale, recomputed per tile from this tile's own
+        # extent width/output size/dpi - the same geometry the renderer
+        # itself will use - so labeling/rule/visibility evaluation matches
+        # the live canvas regardless of the project's scale-calc setting.
+        equator_scale = _equatorial_scale_denominator(extent.width(), TILE_SIZE, self._dpi)
+        scale_scope = QgsExpressionContextScope()
+        scale_scope.setVariable("map_scale", equator_scale, True)
+        ctx = QgsExpressionContext(self._expr_context)
+        ctx.appendScope(scale_scope)
+        settings.setExpressionContext(ctx)
 
         image = QImage(TILE_SIZE, TILE_SIZE, QImage.Format.Format_ARGB32_Premultiplied)
         image.fill(QColor(0, 0, 0, 0))
@@ -580,7 +625,7 @@ class XyzGpkgExporter:
     ):
         self._logger = _make_logger()
         self.project = QgsProject.instance()
-        self.dest_crs = QgsCoordinateReferenceSystem(TILE_MATRIX_CRS_AUTHID)
+        self.dest_crs = QgsCoordinateReferenceSystem("EPSG:4326")
 
         if extent is None:
             extent = self._canvas_extent_or_none()
@@ -605,9 +650,38 @@ class XyzGpkgExporter:
         # explicit per-tile equator scale computed in TileRenderer.
         self.project.writeEntry("Measure", "/ScaleCalcMethod", "AtEquator")
 
+        # Build the labeling engine settings exactly once, here on the main
+        # thread (constructing/mutating QgsLabelingEngineSettings touches
+        # font/text-format resolution and is not safe to do from a worker
+        # thread - see module docstring). Start from the project's own
+        # settings, mirroring the tuple that already works when run from
+        # the Python console, force partial/edge-truncated label
+        # candidates off, and persist it back onto the project so the
+        # project stays internally consistent. The resulting value object
+        # is handed unchanged to every TileRenderer tile.
+        labeling_settings = self.project.labelingEngineSettings()
+        try:
+            partial_candidates_flag = QgsLabelingEngineSettings.Flag.UsePartialCandidates
+        except AttributeError:
+            # Some QGIS point releases hoist the flag onto the class
+            # itself rather than a nested Flag enum; this is the form
+            # confirmed working from the Python console.
+            partial_candidates_flag = QgsLabelingEngineSettings.UsePartialCandidates
+        labeling_settings.setFlag(partial_candidates_flag, False)
+        self.project.setLabelingEngineSettings(labeling_settings)
+        self.labeling_settings = labeling_settings
+
         self.tile_matrix_set = TileMatrixSet(self.dest_crs, self.min_zoom, self.max_zoom)
+        for zoom in range(self.min_zoom, self.max_zoom + 1):
+            self._logger.info(
+                "Tile matrix zoom %d: extent=%s dims=%s",
+                zoom, self.tile_matrix_set.matrix(zoom).extent().toString(),
+                self.tile_matrix_set.matrix_dims(zoom),
+            )
+
         self.empty_detector = EmptyTileDetector(self.project, self.dest_crs, self._logger)
         self._resolve_layers_and_theme()
+        self._logger.info("Resolved %d layer(s) for rendering", len(self.layers))
 
         expr_context = QgsExpressionContext()
         expr_context.appendScope(QgsExpressionContextUtils.globalScope())
@@ -685,20 +759,11 @@ class XyzGpkgExporter:
         max_row = min(matrix_h - 1, max_row)
         return (min_col, min_row, max_col, max_row)
 
-    def _build_zoom_ranges(self) -> Dict[int, Tuple[int, int, int, int]]:
-        # Computed once and reused for both the tile-count estimate and the
-        # submission loop below, instead of recomputing the same
-        # intersect/floor arithmetic for every zoom level twice.
-        ranges: Dict[int, Tuple[int, int, int, int]] = {}
+    def _estimate_total_tiles(self) -> int:
+        total = 0
         for zoom in range(self.min_zoom, self.max_zoom + 1):
             matrix_w, matrix_h = self.tile_matrix_set.matrix_dims(zoom)
-            ranges[zoom] = self._tile_range_for_extent(zoom, matrix_w, matrix_h)
-        return ranges
-
-    @staticmethod
-    def _total_tiles(zoom_ranges: Dict[int, Tuple[int, int, int, int]]) -> int:
-        total = 0
-        for min_col, min_row, max_col, max_row in zoom_ranges.values():
+            min_col, min_row, max_col, max_row = self._tile_range_for_extent(zoom, matrix_w, matrix_h)
             if max_col >= min_col and max_row >= min_row:
                 total += (max_col - min_col + 1) * (max_row - min_row + 1)
         return max(1, total)
@@ -710,7 +775,7 @@ class XyzGpkgExporter:
                 with self._stats_lock:
                     self._tiles_skipped_empty += 1
                 return
-            data = renderer.render_tile(tile_extent, self.dest_crs, zoom)
+            data = renderer.render_tile(tile_extent, self.dest_crs)
             if not data:
                 self._logger.warning("Tile z=%d x=%d y=%d rendered but produced no encoded bytes", zoom, col, row)
                 with self._stats_lock:
@@ -726,27 +791,9 @@ class XyzGpkgExporter:
                 "Failed tile z=%d x=%d y=%d: %s\n%s", zoom, col, row, exc, traceback.format_exc()
             )
 
-    def add_result_layer(self, table_name: str = "xyz_tiles") -> None:
-        """Loads the finished GeoPackage's tile table back into the current
-        QgsProject as a raster layer. Touches QgsProject/the layer tree, so
-        only call this from the main/GUI thread - e.g. from a QgsTask's
-        finished() callback, never from run()/export() itself."""
-        uri = f"GPKG:{self.output_path}:{table_name}"
-        layer_name = os.path.splitext(os.path.basename(self.output_path))[0]
-        try:
-            raster_layer = QgsRasterLayer(uri, layer_name, "gdal")
-            if raster_layer.isValid():
-                self.project.addMapLayer(raster_layer)
-                self._logger.info("Added '%s' to the project as layer '%s'", self.output_path, layer_name)
-            else:
-                self._logger.warning(
-                    "Export finished but the output GeoPackage could not be loaded as a layer (%s)", uri
-                )
-        except Exception as exc:
-            self._logger.warning("Failed to add output GeoPackage to the project: %s", exc)
-
     def export(self) -> str:
         """Runs the export and returns the path to the produced GeoPackage."""
+        self._logger.info("Starting export to %s", self.output_path)
         writer = GeoPackageWriter(
             self.output_path,
             table_name="xyz_tiles",
@@ -764,87 +811,56 @@ class XyzGpkgExporter:
             layers=self.layers,
             style_overrides=self.style_overrides,
             expr_context=self.expr_context,
+            labeling_settings=self.labeling_settings,
             logger=self._logger,
-            tile_matrix_set=self.tile_matrix_set,
-            min_zoom=self.min_zoom,
-            max_zoom=self.max_zoom,
         )
 
         worker_count = _compute_worker_count(self.max_cpu_percent)
-        zoom_ranges = self._build_zoom_ranges()
-        total_estimate = self._total_tiles(zoom_ranges)
-        self._logger.info(
-            "Export starting: %d worker thread(s), %d tile(s) estimated -> %s",
-            worker_count, total_estimate, self.output_path,
-        )
-
-        def _tile_coords():
-            for zoom in range(self.min_zoom, self.max_zoom + 1):
-                min_col, min_row, max_col, max_row = zoom_ranges[zoom]
-                if max_col < min_col or max_row < min_row:
-                    continue
-                for row in range(min_row, max_row + 1):
-                    for col in range(min_col, max_col + 1):
-                        yield (zoom, col, row)
-
-        coords_iter = iter(_tile_coords())
-        # Bound how many futures exist at once instead of submitting every
-        # tile up front: for multi-million-tile exports that upfront
-        # submission loop is itself a long, uninterruptible stretch of
-        # Python code, and it makes cancellation/backpressure cheap since
-        # only a small window of in-flight work ever needs to be tracked.
-        window_size = max(worker_count * 4, worker_count)
+        self._logger.info("Using %d worker threads", worker_count)
+        total_estimate = self._estimate_total_tiles()
+        self._logger.info("Estimated total tiles to process: %d", total_estimate)
         completed = 0
-        last_report_time = time.monotonic()
-        report_interval_sec = 0.5
 
         try:
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="xyztile") as pool:
-                in_flight = set()
-
-                def _submit_next() -> bool:
-                    try:
-                        zoom, col, row = next(coords_iter)
-                    except StopIteration:
-                        return False
-                    in_flight.add(pool.submit(self._process_tile, renderer, writer, zoom, col, row))
-                    return True
-
-                for _ in range(window_size):
-                    if not _submit_next():
+                futures = {}
+                cancelled = False
+                for zoom in range(self.min_zoom, self.max_zoom + 1):
+                    if cancelled:
                         break
+                    matrix_w, matrix_h = self.tile_matrix_set.matrix_dims(zoom)
+                    min_col, min_row, max_col, max_row = self._tile_range_for_extent(zoom, matrix_w, matrix_h)
+                    if max_col < min_col or max_row < min_row:
+                        self._logger.warning("Zoom %d: extent does not intersect this zoom's tile matrix", zoom)
+                        continue
+                    for row in range(min_row, max_row + 1):
+                        if self.should_cancel and self.should_cancel():
+                            cancelled = True
+                            break
+                        for col in range(min_col, max_col + 1):
+                            future = pool.submit(self._process_tile, renderer, writer, zoom, col, row)
+                            futures[future] = (zoom, col, row)
 
-                if not in_flight:
+                if not futures:
                     self._logger.error(
                         "No tiles were submitted for processing at all - check that the export extent "
                         "intersects the project layers and the configured zoom range."
                     )
 
-                cancelled = False
-                while in_flight:
-                    done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
-                    for future in done:
-                        try:
-                            future.result()
-                        except Exception as exc:
-                            with self._stats_lock:
-                                self._tiles_failed += 1
-                            self._logger.error("Tile task raised: %s\n%s", exc, traceback.format_exc())
-                        completed += 1
-                        if not cancelled:
-                            _submit_next()
-
-                    now = time.monotonic()
-                    if self.progress_callback and (
-                        completed >= total_estimate or (now - last_report_time) >= report_interval_sec
-                    ):
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        with self._stats_lock:
+                            self._tiles_failed += 1
+                        self._logger.error("Tile task raised: %s\n%s", exc, traceback.format_exc())
+                    completed += 1
+                    if self.progress_callback:
                         self.progress_callback(completed, total_estimate)
-                        last_report_time = now
-
-                    if not cancelled and self.should_cancel and self.should_cancel():
-                        cancelled = True
-                        for pending in in_flight:
+                    if self.should_cancel and self.should_cancel():
+                        for pending in futures:
                             pending.cancel()
+                        break
         finally:
             writer.close()
 
@@ -866,73 +882,3 @@ class XyzGpkgExporter:
 
     def run(self) -> str:
         return self.export()
-
-
-class XyzGpkgExportTask(QgsTask):
-    """Runs XyzGpkgExporter.export() on a QgsTask background thread.
-
-    QgsTask.run() executes on a worker thread managed by QGIS's own task
-    manager - never the GUI thread - so the tile-submission loop and every
-    render/write call happen without blocking the QGIS UI, regardless of
-    how many tiles there are or how high max_cpu_percent is set.
-
-    finished() is invoked back on the main/GUI thread by the task manager
-    once run() returns, which is the only safe place to touch QgsProject -
-    so the output layer is added there, never from inside export() itself.
-
-    Progress is surfaced through QgsTask.setProgress(), which the QGIS
-    task manager already throttles/coalesces for UI updates; the exporter
-    itself only calls back at most twice a second regardless of tile
-    count, so neither the log nor the progress bar gets flooded.
-    """
-
-    def __init__(self, exporter: "XyzGpkgExporter", description: str = "Exporting XYZ tiles to GeoPackage"):
-        super().__init__(description, QgsTask.Flag.CanCancel)
-        self._exporter = exporter
-        self._exporter.progress_callback = self._on_progress
-        self._exporter.should_cancel = self.isCanceled
-        self.output_path: Optional[str] = None
-        self.error: Optional[str] = None
-
-    def _on_progress(self, completed: int, total: int) -> None:
-        self.setProgress(100.0 * completed / total if total else 0.0)
-
-    def run(self) -> bool:
-        try:
-            self.output_path = self._exporter.export()
-            return self._exporter._tiles_written > 0
-        except Exception as exc:
-            self.error = f"{exc}\n{traceback.format_exc()}"
-            return False
-
-    def finished(self, result: bool) -> None:
-        # Runs on the main/GUI thread - safe to touch QgsProject here.
-        if result and self.output_path:
-            try:
-                self._exporter.add_result_layer()
-            except Exception as exc:
-                QgsMessageLog.logMessage(
-                    f"XyzGpkgExporter: failed to add result layer: {exc}", LOG_TAG, Qgis.MessageLevel.Warning
-                )
-            QgsMessageLog.logMessage(
-                f"XYZ export finished: {self.output_path}", LOG_TAG, Qgis.MessageLevel.Info
-            )
-        elif self.isCanceled():
-            QgsMessageLog.logMessage("XYZ export cancelled", LOG_TAG, Qgis.MessageLevel.Warning)
-        else:
-            QgsMessageLog.logMessage(
-                f"XYZ export failed: {self.error or 'no tiles written'}", LOG_TAG, Qgis.MessageLevel.Critical
-            )
-
-
-def start_xyz_gpkg_export(**exporter_kwargs) -> XyzGpkgExportTask:
-    """Recommended entry point for plugin/GUI code: builds the exporter and
-    hands it to QGIS's task manager, returning immediately. The GUI is
-    never blocked - not during setup, not during rendering - regardless of
-    tile count or max_cpu_percent. For non-interactive/console use where
-    blocking is fine, construct XyzGpkgExporter directly and call
-    .export() (then .add_result_layer() if desired) instead."""
-    exporter = XyzGpkgExporter(**exporter_kwargs)
-    task = XyzGpkgExportTask(exporter)
-    QgsApplication.taskManager().addTask(task)
-    return task
