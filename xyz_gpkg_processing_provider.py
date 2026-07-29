@@ -133,7 +133,9 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
 
         min_zoom = self.parameterAsInt(parameters, self.MIN_ZOOM, context)
         max_zoom = self.parameterAsInt(parameters, self.MAX_ZOOM, context)
+        
         dpi = self.parameterAsInt(parameters, self.DPI, context)
+
         cpu_percent = self.parameterAsInt(parameters, self.CPU_PERCENT, context)
         format_index = self.parameterAsEnum(parameters, self.TILE_FORMAT, context)
         tile_format = TILE_FORMATS[format_index]
