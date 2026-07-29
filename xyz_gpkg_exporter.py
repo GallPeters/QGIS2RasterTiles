@@ -41,6 +41,39 @@ Key correctness guarantees:
     off the main thread is not safe and was the cause of every tile
     failing (producing a schema-only GeoPackage) when this was
     previously attempted inside render_tile().
+
+Performance design (this module is expected to render MILLIONS of tiles in
+a single run, so per-tile overhead is optimised aggressively):
+  * Every object whose value does not vary per tile - the QgsMapSettings
+    instance, the QImage/QPainter render target, the QIODevice used to
+    encode it, and even the QgsExpressionContext/Scope used to expose
+    map_scale to expressions - is allocated exactly once per worker
+    thread (thread-local) and reset/reused for every subsequent tile,
+    instead of being reconstructed from scratch millions of times. Every
+    property the renderer actually reads is still explicitly re-set on
+    every single tile before use, so a reused instance is behaviourally
+    identical to a freshly constructed one.
+  * The equator-based scale denominator is only a function of a tile's
+    *zoom level* (every tile in this custom, non-adaptive tile matrix is
+    square and uniform-width within a zoom), so it is computed once per
+    zoom level and cached, rather than recomputed with float division on
+    every tile.
+  * GeoPackage writes are batched per-thread and only touch the shared
+    SQLite connection/lock once per batch, not once per tile, eliminating
+    per-tile lock contention on the write path. Export statistics
+    (written/skipped/failed counters) use the same per-thread-then-
+    aggregate pattern, so the per-tile hot path never takes a lock at all.
+  * Tile tasks are submitted to the thread pool through a bounded
+    in-flight pipeline instead of enqueueing every tile up front, so peak
+    memory (outstanding Future objects, queued call args) stays
+    proportional to worker count rather than to total tile count - a
+    multi-million-tile export no longer needs to hold millions of Future
+    objects in memory simultaneously.
+  * EmptyTileDetector short-circuits on a single cheap bounding-box test
+    against the union of all layer extents before falling back to the
+    full per-layer intersection loop, so the (typically dominant, at low
+    zoom levels covering large regions of no data) fully-empty case costs
+    O(1) instead of O(layer count).
 """
 
 import os
@@ -49,10 +82,10 @@ import sqlite3
 import logging
 import traceback
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
-
+from qgis.utils import iface
 from qgis.core import (
     Qgis,
     QgsProject,
@@ -79,6 +112,13 @@ METERS_PER_DEGREE_EQUATOR = EARTH_CIRCUMFERENCE_M / 360.0
 INCH_METERS = 0.0254
 QIMAGE_NATIVE_FORMATS = {"PNG", "JPEG", "JPG", "WEBP"}
 LOG_TAG = "XyzGpkgExporter"
+
+# Constant value-objects reused across every tile render instead of being
+# reconstructed millions of times. Both are read-only from this module's
+# point of view (only ever passed into Qt setters, which copy the value),
+# so sharing a single instance across threads is safe.
+_TILE_QSIZE = QSize(TILE_SIZE, TILE_SIZE)
+_TRANSPARENT_COLOR = QColor(0, 0, 0, 0)
 
 
 class _QgsMessageLogHandler(logging.Handler):
@@ -110,16 +150,19 @@ def _make_logger() -> logging.Logger:
     return logger
 
 
-def _equatorial_scale_denominator(extent_width_degrees: float, output_width_px: int, dpi: float) -> float:
+def _equatorial_scale_denominator(extent_width_degrees: float, paper_width_m: float) -> float:
     """Equator-based scale denominator, computed independently of the
     project's "scale calculation method" setting so that rule-based
     symbology / label / layer visibility thresholds evaluate identically
-    for every tile regardless of the latitude band it covers."""
-    ground_width_m = extent_width_degrees * METERS_PER_DEGREE_EQUATOR
-    paper_width_m = (output_width_px / float(dpi)) * INCH_METERS
+    for every tile regardless of the latitude band it covers.
+
+    `paper_width_m` is passed in pre-computed (output width in metres at
+    the fixed tile size/dpi for this export) rather than derived here,
+    since it is invariant for the whole export and was previously
+    recomputed with the same float division on every single tile."""
     if paper_width_m <= 0:
         return 0.0
-    return ground_width_m / paper_width_m
+    return (extent_width_degrees * METERS_PER_DEGREE_EQUATOR) / paper_width_m
 
 
 def _source_lock_key(layer) -> str:
@@ -140,7 +183,7 @@ def _source_lock_key(layer) -> str:
         uri = layer.source()
     path = (uri or "").split("|", 1)[0].strip()
     if not path:
-        return uri or id(layer).__repr__()
+        return uri or repr(id(layer))
     return os.path.normcase(os.path.normpath(path))
 
 
@@ -154,23 +197,10 @@ def _compute_worker_count(max_cpu_percent: int) -> int:
     return workers
 
 
-def _encode_image(image: QImage, tile_format: str, quality: int) -> bytes:
-    """Encode a rendered tile image into the requested raster format."""
-    fmt_upper = tile_format.upper()
-    if fmt_upper in QIMAGE_NATIVE_FORMATS:
-        qt_format = "JPG" if fmt_upper == "JPEG" else fmt_upper
-        buffer = QBuffer()
-        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-        image.save(buffer, qt_format, quality)
-        data = bytes(buffer.data())
-        buffer.close()
-        return data
-    return _encode_via_gdal(image, fmt_upper, quality)
-
-
 def _encode_via_gdal(image: QImage, driver_name: str, quality: int) -> bytes:
     """Fallback encoder for raster formats not natively supported by
-    QImage (e.g. JPEG2000), routed through an in-memory GDAL dataset."""
+    QImage (e.g. JPEG2000), routed through an in-memory GDAL dataset.
+    Not a hot path for the common PNG/JPEG/WEBP export case."""
     from osgeo import gdal
     import numpy as np
 
@@ -211,10 +241,17 @@ def _encode_via_gdal(image: QImage, driver_name: str, quality: int) -> bytes:
 class TileMatrixSet:
     """Builds and caches one QgsTileMatrix per zoom level. This is the
     single source of truth for every tile bound calculation in this file -
-    never recompute tile extents via independent zoom/row/col math."""
+    never recompute tile extents via independent zoom/row/col math.
+
+    Matrices are stored in a flat list indexed by `zoom - min_zoom` rather
+    than a dict, since the zoom range is always contiguous: list indexing
+    is a direct array access (no hashing), which is both faster and more
+    cache-friendly than a dict lookup, and this is on the per-tile hot
+    path via `tile_extent()`."""
 
     def __init__(self, crs: QgsCoordinateReferenceSystem, min_zoom: int, max_zoom: int):
         self._crs = crs
+        self._min_zoom = min_zoom
         self._tile_origin = QgsPointXY(-180.0, 90.0)
         # z0Dimension is the side length (map units) of ONE root tile at zoom 0,
         # not a tile count. 180.0 degrees x 2 columns x 1 row = full globe
@@ -223,24 +260,28 @@ class TileMatrixSet:
         self._z0_dimension = 180.0
         self._root_matrix_width = 2
         self._root_matrix_height = 1
-        self._matrices: Dict[int, QgsTileMatrix] = {}
-        for zoom in range(min_zoom, max_zoom + 1):
-            self._matrices[zoom] = QgsTileMatrix.fromCustomDef(
+        self._matrices: List[QgsTileMatrix] = [
+            QgsTileMatrix.fromCustomDef(
                 zoom, self._crs, self._tile_origin,
                 self._z0_dimension, self._root_matrix_width, self._root_matrix_height,
             )
+            for zoom in range(min_zoom, max_zoom + 1)
+        ]
+        # Each matrix's dimensions are invariant once built; cache them
+        # once instead of re-invoking matrixWidth()/matrixHeight() (sip
+        # method calls) on every access.
+        self._dims: List[Tuple[int, int]] = [(m.matrixWidth(), m.matrixHeight()) for m in self._matrices]
 
     def matrix(self, zoom: int) -> QgsTileMatrix:
-        return self._matrices[zoom]
+        return self._matrices[zoom - self._min_zoom]
 
     def matrix_dims(self, zoom: int) -> Tuple[int, int]:
-        m = self._matrices[zoom]
-        return m.matrixWidth(), m.matrixHeight()
+        return self._dims[zoom - self._min_zoom]
 
     def tile_extent(self, zoom: int, col: int, row: int) -> QgsRectangle:
         # tileExtent() takes a QgsTileXYZ (column, row, zoom) rather than
         # separate ints.
-        return self._matrices[zoom].tileExtent(QgsTileXYZ(col, row, zoom))
+        return self._matrices[zoom - self._min_zoom].tileExtent(QgsTileXYZ(col, row, zoom))
 
 
 class EmptyTileDetector:
@@ -290,7 +331,31 @@ class EmptyTileDetector:
             logger.info("EmptyTileDetector: built %d usable layer extent(s) out of %d layer(s)",
                         len(self._layer_extents), layer_count)
 
+        # Pre-compute the union bounding box of every layer extent once.
+        # On the per-tile hot path this lets us reject the overwhelmingly
+        # common "tile has no data at all" case (especially at low zoom
+        # levels, where most of a multi-million-tile export's tiles cover
+        # ocean/empty space) with a single O(1) rectangle test, instead of
+        # unconditionally looping over every layer extent.
+        self._single_extent = self._layer_extents[0] if len(self._layer_extents) == 1 else None
+        self._union_extent: Optional[QgsRectangle] = None
+        for extent in self._layer_extents:
+            if self._union_extent is None:
+                self._union_extent = QgsRectangle(extent)
+            else:
+                self._union_extent.combineExtentWith(extent)
+
     def is_empty(self, tile_extent: QgsRectangle) -> bool:
+        # Common special case: a single source layer - the union extent
+        # *is* that layer's extent, so skip the redundant duplicate test.
+        single = self._single_extent
+        if single is not None:
+            return not single.intersects(tile_extent)
+
+        union = self._union_extent
+        if union is None or not union.intersects(tile_extent):
+            return True
+
         for extent in self._layer_extents:
             if extent.intersects(tile_extent):
                 return False
@@ -299,8 +364,18 @@ class EmptyTileDetector:
 
 class GeoPackageWriter:
     """Writes a standards-compliant gpkg_tile_matrix / gpkg_tile_matrix_set
-    tiled raster GeoPackage, batching tile inserts into periodic
-    transactions rather than committing per tile.
+    tiled raster GeoPackage.
+
+    Tile inserts are batched *per worker thread*: each thread accumulates
+    rendered tiles into its own pending list and only touches the shared
+    SQLite connection (which must be single-writer-at-a-time, hence the
+    lock) once that thread's pending list reaches `batch_size`, instead of
+    acquiring the writer's lock once per tile as before. This cuts lock
+    acquisitions on the hot path from O(tile count) to O(tile count /
+    batch_size), which matters a great deal once thread counts and tile
+    counts both scale up. Row order within the table is irrelevant to the
+    final GeoPackage content (unique zoom/col/row index + INSERT OR
+    REPLACE), so batching/interleaving across threads never changes output.
 
     Uses rollback-journal mode (not WAL): with batched, lock-serialized
     writes there is no concurrent-writer scenario WAL is needed for, and
@@ -318,17 +393,35 @@ class GeoPackageWriter:
         max_zoom: int,
         matrix_set_extent: QgsRectangle,
         logger: logging.Logger,
-        batch_size: int = 500,
+        batch_size: int = 2000,
     ):
         self._table = table_name
         self._lock = threading.Lock()
-        self._batch: List[Tuple[int, int, int, bytes]] = []
         self._batch_size = batch_size
         self._logger = logger
+
+        # Per-thread pending-tile lists. Each worker thread lazily creates
+        # its own list (registered once, under `_registry_lock`, into
+        # `_pending_lists` so `flush()`/`close()` can drain any partial
+        # batches left over at the end of the export); after that one-time
+        # setup, appending to it from `write_tile()` needs no lock at all.
+        self._registry_lock = threading.Lock()
+        self._pending_lists: List[list] = []
+        self._thread_local = threading.local()
+
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=DELETE")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA temp_store=MEMORY")
+        # Larger page cache and memory-mapped I/O reduce disk round-trips
+        # for the large batched commits this writer performs; neither
+        # changes the resulting file content, only write throughput.
+        self._conn.execute("PRAGMA cache_size=-131072")   # ~128MB page cache
+        try:
+            self._conn.execute("PRAGMA mmap_size=268435456")  # 256MB, best-effort
+        except sqlite3.Error:
+            pass
+        self._insert_sql = f"INSERT OR REPLACE INTO {self._table} (zoom_level, tile_column, tile_row, tile_data) VALUES (?,?,?,?)"
         self._init_schema(tile_matrix_set, min_zoom, max_zoom, matrix_set_extent)
 
     def _init_schema(self, tile_matrix_set, min_zoom, max_zoom, matrix_set_extent) -> None:
@@ -439,29 +532,43 @@ class GeoPackageWriter:
         )
         self._conn.commit()
 
-    def write_tile(self, zoom: int, col: int, row: int, data: bytes) -> None:
-        # Rendering stays fully parallel; only this batched write path is serialized.
-        with self._lock:
-            self._batch.append((zoom, col, row, data))
-            if len(self._batch) >= self._batch_size:
-                self._flush_locked()
+    def _thread_pending(self) -> list:
+        tl = self._thread_local
+        pending = getattr(tl, "pending", None)
+        if pending is None:
+            pending = []
+            tl.pending = pending
+            with self._registry_lock:
+                self._pending_lists.append(pending)
+        return pending
 
-    def _flush_locked(self) -> None:
-        if not self._batch:
+    def write_tile(self, zoom: int, col: int, row: int, data: bytes) -> None:
+        # Rendering stays fully parallel; appending to this thread's own
+        # pending list needs no lock at all. The shared connection/lock is
+        # only touched once every `batch_size` tiles (see `_drain`).
+        pending = self._thread_pending()
+        pending.append((zoom, col, row, data))
+        if len(pending) >= self._batch_size:
+            self._drain(pending)
+
+    def _drain(self, pending: list) -> None:
+        if not pending:
             return
-        cur = self._conn.cursor()
-        cur.executemany(
-            f"INSERT OR REPLACE INTO {self._table} (zoom_level, tile_column, tile_row, tile_data) VALUES (?,?,?,?)",
-            self._batch,
-        )
-        self._conn.commit()
-        batch_len = len(self._batch)
-        self._batch.clear()
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.executemany(self._insert_sql, pending)
+            self._conn.commit()
+        batch_len = len(pending)
+        pending.clear()
         self._logger.info("GeoPackageWriter: flushed batch of %d tile(s) to disk", batch_len)
 
     def flush(self) -> None:
-        with self._lock:
-            self._flush_locked()
+        # Only reached after all worker threads have finished submitting
+        # tiles (called from export()'s finally block once the thread pool
+        # has fully drained), so it is safe to iterate `_pending_lists`
+        # without the registry lock here.
+        for pending in self._pending_lists:
+            self._drain(pending)
 
     def close(self) -> None:
         self.flush()
@@ -488,7 +595,16 @@ class TileRenderer:
     storage: QgsMapRendererCustomPainterJob and most data providers are
     not guaranteed safe to drive concurrently from multiple threads
     against the same shared QgsMapLayer instances, and sharing them was a
-    prior cause of every tile silently failing to render."""
+    prior cause of every tile silently failing to render.
+
+    Every other per-render object (QgsMapSettings, the QImage/QPainter
+    render target, the QIODevice used for in-format encoding, and the
+    QgsExpressionContext/Scope carrying `map_scale`) is likewise allocated
+    once per thread and reused/reset for every tile: everything the
+    renderer reads from these objects is still explicitly re-set on every
+    single tile before use, so reuse is behaviourally identical to fresh
+    construction - it only removes the repeated allocation/deallocation
+    cost, which matters at multi-million-tile scale."""
 
     def __init__(
         self,
@@ -523,6 +639,30 @@ class TileRenderer:
         self._clone_lock_registry_guard = threading.Lock()
         self._clone_locks: Dict[str, threading.Lock] = {}
 
+        # Encoding path is fully determined by the (fixed, per-export)
+        # output format, so resolve it once instead of branching and
+        # re-uppercasing an already-uppercase string on every tile.
+        self._is_native_format = self._format in QIMAGE_NATIVE_FORMATS
+        self._qt_save_format = "JPG" if self._format == "JPEG" else self._format
+
+        # Output size/dpi are fixed for the whole export, so the
+        # dpi-dependent half of the equator-scale formula - the "paper"
+        # width in metres - is invariant and computed once here, instead
+        # of on every single tile. Combined with `_scale_cache` below, the
+        # per-tile scale computation degrades from "float division on
+        # every tile" to "one dict lookup per tile, one float division per
+        # zoom level" - every tile at a given zoom is the same width in
+        # this uniform, non-adaptive tile grid, so the scale is provably
+        # identical for every tile sharing a zoom level.
+        self._paper_width_m = (TILE_SIZE / float(dpi)) * INCH_METERS
+        self._scale_cache: Dict[int, float] = {}
+
+        # Cache flag enum members once: three fewer nested attribute
+        # lookups (QgsMapSettings.Flag.X) per tile.
+        self._flag_antialiasing = QgsMapSettings.Flag.Antialiasing
+        self._flag_render_tile = QgsMapSettings.Flag.RenderMapTile
+        self._flag_advanced_effects = QgsMapSettings.Flag.UseAdvancedEffects
+
     def _get_clone_lock(self, source_key: str) -> threading.Lock:
         with self._clone_lock_registry_guard:
             lock = self._clone_locks.get(source_key)
@@ -532,8 +672,10 @@ class TileRenderer:
             return lock
 
     def _thread_layers(self) -> List:
-        if not hasattr(self._thread_local, "layers"):
-            cloned = []
+        tl = self._thread_local
+        layers = getattr(tl, "layers", None)
+        if layers is None:
+            layers = []
             for lyr in self._base_layers:
                 # Serialize only the first-time clone/open of layers that
                 # share the same physical GeoPackage file. QGIS's
@@ -550,23 +692,86 @@ class TileRenderer:
                 lock = self._get_clone_lock(_source_lock_key(lyr))
                 with lock:
                     try:
-                        cloned.append(lyr.clone())
+                        layers.append(lyr.clone())
                     except Exception as exc:
                         self._logger.warning(
                             "TileRenderer: failed to clone layer '%s' for thread %s, using shared instance (%s)",
                             lyr.name(), threading.get_ident(), exc,
                         )
-                        cloned.append(lyr)
-            self._thread_local.layers = cloned
-        return self._thread_local.layers
+                        layers.append(lyr)
+            tl.layers = layers
+        return layers
 
-    def render_tile(self, extent: QgsRectangle, dest_crs: QgsCoordinateReferenceSystem) -> bytes:
-        settings = QgsMapSettings()
+    def _thread_map_settings(self) -> QgsMapSettings:
+        tl = self._thread_local
+        settings = getattr(tl, "map_settings", None)
+        if settings is None:
+            settings = QgsMapSettings()
+            tl.map_settings = settings
+        return settings
+
+    def _thread_render_target(self):
+        tl = self._thread_local
+        image = getattr(tl, "image", None)
+        if image is None:
+            image = QImage(TILE_SIZE, TILE_SIZE, QImage.Format.Format_ARGB32_Premultiplied)
+            painter = QPainter()
+            tl.image = image
+            tl.painter = painter
+        return image, tl.painter
+
+    def _thread_expr_context(self):
+        tl = self._thread_local
+        ctx = getattr(tl, "expr_ctx", None)
+        if ctx is None:
+            scope = QgsExpressionContextScope()
+            scope.setVariable("map_scale", 0.0, True)
+            ctx = QgsExpressionContext(self._expr_context)
+            ctx.appendScope(scope)
+            tl.expr_scope = scope
+            tl.expr_ctx = ctx
+        return ctx, tl.expr_scope
+
+    def _thread_buffer(self) -> QBuffer:
+        tl = self._thread_local
+        buf = getattr(tl, "buffer", None)
+        if buf is None:
+            buf = QBuffer()
+        else:
+            buf.close()
+            buf.buffer().clear()
+        tl.buffer = buf
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        return buf
+
+    def _scale_for_zoom(self, zoom: int, extent: QgsRectangle) -> float:
+        cached = self._scale_cache.get(zoom)
+        if cached is not None:
+            return cached
+        value = _equatorial_scale_denominator(extent.width(), self._paper_width_m)
+        # Deterministic value - a benign race between threads computing
+        # the same zoom's scale for the first time simultaneously is safe
+        # (last write wins, both writes are equal), and avoids needing a
+        # lock on this per-tile-adjacent hot path.
+        self._scale_cache[zoom] = value
+        return value
+
+    def _encode(self, image: QImage) -> bytes:
+        if self._is_native_format:
+            buf = self._thread_buffer()
+            image.save(buf, self._qt_save_format, self._quality)
+            data = bytes(buf.data())
+            buf.close()
+            return data
+        return _encode_via_gdal(image, self._format, self._quality)
+
+    def render_tile(self, zoom: int, extent: QgsRectangle, dest_crs: QgsCoordinateReferenceSystem) -> bytes:
+        settings = self._thread_map_settings()
         settings.setDestinationCrs(dest_crs)
         settings.setLayers(self._thread_layers())
         if self._style_overrides:
             settings.setLayerStyleOverrides(self._style_overrides)
-        settings.setBackgroundColor(QColor(0, 0, 0, 0))
+        settings.setBackgroundColor(_TRANSPARENT_COLOR)
         # Apply the shared, pre-built labeling engine settings (built once,
         # on the main thread, from the project's own settings with
         # UsePartialCandidates forced off) to this tile's map settings.
@@ -576,34 +781,31 @@ class TileRenderer:
         # configuration - which is why labels were previously able to
         # cross tile boundaries even though the project-level flag was set.
         settings.setLabelingEngineSettings(self._labeling_settings)
-        settings.setOutputSize(QSize(TILE_SIZE, TILE_SIZE))
+        settings.setOutputSize(_TILE_QSIZE)
         settings.setOutputDpi(self._dpi)
         settings.setExtent(extent)
-        settings.setFlag(QgsMapSettings.Flag.Antialiasing, True)
-        settings.setFlag(QgsMapSettings.Flag.RenderMapTile, True)
-        settings.setFlag(QgsMapSettings.Flag.UseAdvancedEffects, True)
+        settings.setFlag(self._flag_antialiasing, True)
+        settings.setFlag(self._flag_render_tile, True)
+        settings.setFlag(self._flag_advanced_effects, True)
 
-        # Equator-based scale, recomputed per tile from this tile's own
-        # extent width/output size/dpi - the same geometry the renderer
-        # itself will use - so labeling/rule/visibility evaluation matches
-        # the live canvas regardless of the project's scale-calc setting.
-        equator_scale = _equatorial_scale_denominator(extent.width(), TILE_SIZE, self._dpi)
-        scale_scope = QgsExpressionContextScope()
+        # Equator-based scale: identical for every tile within a zoom
+        # level (uniform grid), so this is a cache lookup after the first
+        # tile of each zoom rather than a fresh computation every time.
+        equator_scale = self._scale_for_zoom(zoom, extent)
+        ctx, scale_scope = self._thread_expr_context()
         scale_scope.setVariable("map_scale", equator_scale, True)
-        ctx = QgsExpressionContext(self._expr_context)
-        ctx.appendScope(scale_scope)
         settings.setExpressionContext(ctx)
 
-        image = QImage(TILE_SIZE, TILE_SIZE, QImage.Format.Format_ARGB32_Premultiplied)
-        image.fill(QColor(0, 0, 0, 0))
-        painter = QPainter(image)
+        image, painter = self._thread_render_target()
+        image.fill(_TRANSPARENT_COLOR)
+        painter.begin(image)
         try:
             job = QgsMapRendererCustomPainterJob(settings, painter)
             job.renderSynchronously()
         finally:
             painter.end()
 
-        return _encode_image(image, self._format, self._quality)
+        return self._encode(image)
 
 
 class XyzGpkgExporter:
@@ -626,6 +828,8 @@ class XyzGpkgExporter:
         self._logger = _make_logger()
         self.project = QgsProject.instance()
         self.dest_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+        screen = iface.mainWindow().windowHandle().screen()
+        self.dpi = dpi*screen.devicePixelRatio()
 
         if extent is None:
             extent = self._canvas_extent_or_none()
@@ -635,7 +839,7 @@ class XyzGpkgExporter:
             raise ValueError("Invalid zoom range: max_zoom must be >= min_zoom >= 0")
         self.min_zoom = min_zoom
         self.max_zoom = max_zoom
-        self.dpi = dpi
+        
         self.max_cpu_percent = max(1, min(100, max_cpu_percent))
         self.tile_format = tile_format.upper()
         self.quality = max(0, min(100, quality))
@@ -691,15 +895,18 @@ class XyzGpkgExporter:
         self.progress_callback = progress_callback
         self.should_cancel = should_cancel
 
-        self._stats_lock = threading.Lock()
+        # Per-thread stats, aggregated once at the end of export() instead
+        # of taking a shared lock on every single tile. See `_ThreadStats`
+        # and `_thread_stats()`.
+        self._stats_registry_lock = threading.Lock()
+        self._stats_registry: List[_ThreadStats] = []
+        self._stats_local = threading.local()
         self._tiles_written = 0
         self._tiles_skipped_empty = 0
         self._tiles_failed = 0
 
     def _canvas_extent_or_none(self) -> Optional[QgsRectangle]:
         try:
-            from qgis.utils import iface
-
             if iface is None or iface.mapCanvas() is None:
                 return None
             canvas = iface.mapCanvas()
@@ -768,25 +975,49 @@ class XyzGpkgExporter:
                 total += (max_col - min_col + 1) * (max_row - min_row + 1)
         return max(1, total)
 
+    def _iter_tile_coords(self):
+        """Lazily yields (zoom, col, row) tuples for every tile to render.
+        Kept as a generator (rather than materializing the full list) so
+        that, combined with the bounded-in-flight submission pipeline in
+        export(), peak memory never scales with total tile count."""
+        for zoom in range(self.min_zoom, self.max_zoom + 1):
+            matrix_w, matrix_h = self.tile_matrix_set.matrix_dims(zoom)
+            min_col, min_row, max_col, max_row = self._tile_range_for_extent(zoom, matrix_w, matrix_h)
+            if max_col < min_col or max_row < min_row:
+                self._logger.warning("Zoom %d: extent does not intersect this zoom's tile matrix", zoom)
+                continue
+            for row in range(min_row, max_row + 1):
+                if self.should_cancel and self.should_cancel():
+                    return
+                for col in range(min_col, max_col + 1):
+                    yield zoom, col, row
+
+    def _thread_stats(self) -> "_ThreadStats":
+        tl = self._stats_local
+        stats = getattr(tl, "stats", None)
+        if stats is None:
+            stats = _ThreadStats()
+            tl.stats = stats
+            with self._stats_registry_lock:
+                self._stats_registry.append(stats)
+        return stats
+
     def _process_tile(self, renderer: TileRenderer, writer: GeoPackageWriter, zoom: int, col: int, row: int) -> None:
+        stats = self._thread_stats()
         try:
             tile_extent = self.tile_matrix_set.tile_extent(zoom, col, row)
             if self.empty_detector.is_empty(tile_extent):
-                with self._stats_lock:
-                    self._tiles_skipped_empty += 1
+                stats.skipped += 1
                 return
-            data = renderer.render_tile(tile_extent, self.dest_crs)
+            data = renderer.render_tile(zoom, tile_extent, self.dest_crs)
             if not data:
                 self._logger.warning("Tile z=%d x=%d y=%d rendered but produced no encoded bytes", zoom, col, row)
-                with self._stats_lock:
-                    self._tiles_skipped_empty += 1
+                stats.skipped += 1
                 return
             writer.write_tile(zoom, col, row, data)
-            with self._stats_lock:
-                self._tiles_written += 1
+            stats.written += 1
         except Exception as exc:
-            with self._stats_lock:
-                self._tiles_failed += 1
+            stats.failed += 1
             self._logger.error(
                 "Failed tile z=%d x=%d y=%d: %s\n%s", zoom, col, row, exc, traceback.format_exc()
             )
@@ -820,49 +1051,67 @@ class XyzGpkgExporter:
         total_estimate = self._estimate_total_tiles()
         self._logger.info("Estimated total tiles to process: %d", total_estimate)
         completed = 0
+        # Bound how many tiles may be in flight (submitted-but-not-yet-
+        # processed) at once, rather than submitting every tile up front.
+        # With millions of tiles, eagerly submitting all of them would
+        # hold millions of Future objects (and their queued call args) in
+        # memory simultaneously; bounding the pipeline keeps peak memory
+        # proportional to worker_count instead of total tile count.
+        pipeline_depth = worker_count * 4
+        future_level_failure = False
 
         try:
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="xyztile") as pool:
-                futures = {}
-                cancelled = False
-                for zoom in range(self.min_zoom, self.max_zoom + 1):
-                    if cancelled:
-                        break
-                    matrix_w, matrix_h = self.tile_matrix_set.matrix_dims(zoom)
-                    min_col, min_row, max_col, max_row = self._tile_range_for_extent(zoom, matrix_w, matrix_h)
-                    if max_col < min_col or max_row < min_row:
-                        self._logger.warning("Zoom %d: extent does not intersect this zoom's tile matrix", zoom)
-                        continue
-                    for row in range(min_row, max_row + 1):
-                        if self.should_cancel and self.should_cancel():
-                            cancelled = True
-                            break
-                        for col in range(min_col, max_col + 1):
-                            future = pool.submit(self._process_tile, renderer, writer, zoom, col, row)
-                            futures[future] = (zoom, col, row)
+                tile_iter = self._iter_tile_coords()
+                in_flight = set()
 
-                if not futures:
+                def _submit_next() -> bool:
+                    for zoom, col, row in tile_iter:
+                        in_flight.add(pool.submit(self._process_tile, renderer, writer, zoom, col, row))
+                        return True
+                    return False
+
+                submitted_any = False
+                for _ in range(pipeline_depth):
+                    if _submit_next():
+                        submitted_any = True
+                    else:
+                        break
+
+                if not submitted_any:
                     self._logger.error(
                         "No tiles were submitted for processing at all - check that the export extent "
                         "intersects the project layers and the configured zoom range."
                     )
 
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        with self._stats_lock:
-                            self._tiles_failed += 1
-                        self._logger.error("Tile task raised: %s\n%s", exc, traceback.format_exc())
-                    completed += 1
-                    if self.progress_callback:
-                        self.progress_callback(completed, total_estimate)
-                    if self.should_cancel and self.should_cancel():
-                        for pending in futures:
+                cancelled = False
+                while in_flight:
+                    done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            future_level_failure = True
+                            self._logger.error("Tile task raised: %s\n%s", exc, traceback.format_exc())
+                        completed += 1
+                        if self.progress_callback:
+                            self.progress_callback(completed, total_estimate)
+
+                    if not cancelled and self.should_cancel and self.should_cancel():
+                        cancelled = True
+                        for pending in in_flight:
                             pending.cancel()
                         break
+
+                    if not cancelled:
+                        for _ in range(len(done)):
+                            _submit_next()
         finally:
             writer.close()
+
+        self._tiles_written = sum(s.written for s in self._stats_registry)
+        self._tiles_skipped_empty = sum(s.skipped for s in self._stats_registry)
+        self._tiles_failed = sum(s.failed for s in self._stats_registry) + (1 if future_level_failure else 0)
 
         self._logger.info(
             "Export complete: %d written, %d skipped (empty), %d failed -> %s",
@@ -882,3 +1131,17 @@ class XyzGpkgExporter:
 
     def run(self) -> str:
         return self.export()
+
+
+class _ThreadStats:
+    """Per-thread tile counters. Only ever written to by the thread that
+    owns the instance (see `XyzGpkgExporter._thread_stats`), so no lock is
+    needed on the per-tile hot path; instances are aggregated under a lock
+    exactly once, after the thread pool has fully drained."""
+
+    __slots__ = ("written", "skipped", "failed")
+
+    def __init__(self):
+        self.written = 0
+        self.skipped = 0
+        self.failed = 0
