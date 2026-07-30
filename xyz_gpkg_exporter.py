@@ -1087,7 +1087,23 @@ class TileRenderer:
 
 class XyzGpkgExporter:
     """Exports the currently loaded QGIS project as raster XYZ tiles into a
-    single GeoPackage. Single public entry point: `export()` / `run()`."""
+    single GeoPackage. Single public entry point: `export()` / `run()` -
+    prefer `run_in_background()` (a classmethod on this class) over
+    calling either of those directly if you want the GUI to stay usable.
+
+    Construction (`__init__`) only performs the small pieces of setup that
+    must run on the main/GUI thread (resolving the active map theme/
+    checked layers via `iface`, and constructing/mutating the project's
+    QgsLabelingEngineSettings) - both fast, O(1) operations. The genuinely
+    slow part - building the TileMatrixSet and, especially, the
+    OccupancyIndex, which walks every feature of every rendered layer and
+    gets slower the deeper the requested max zoom goes - is deferred to
+    `_prepare()`, called at the very start of `export()` rather than in
+    `__init__`. That split is what lets `run_in_background()` keep the GUI
+    responsive even for a full zoom-0-through-18 export: constructing the
+    exporter (on the calling/GUI thread) stays cheap, and all of the
+    expensive work happens inside `export()`, which only ever runs on a
+    QgsTask worker thread when reached via `run_in_background()`."""
 
     def __init__(
         self,
@@ -1151,6 +1167,62 @@ class XyzGpkgExporter:
         self.project.setLabelingEngineSettings(labeling_settings)
         self.labeling_settings = labeling_settings
 
+        self._resolve_layers_and_theme()
+        self._logger.info("Resolved %d layer(s) for rendering", len(self.layers))
+
+        expr_context = QgsExpressionContext()
+        expr_context.appendScope(QgsExpressionContextUtils.globalScope())
+        expr_context.appendScope(QgsExpressionContextUtils.projectScope(self.project))
+        self.expr_context = expr_context
+
+        self.progress_callback = progress_callback
+        self.should_cancel = should_cancel
+        self._occupancy_tile_buffer = occupancy_tile_buffer
+
+        # Deliberately NOT built here - see _prepare(). Everything above
+        # this point touches iface/mapCanvas or QgsLabelingEngineSettings
+        # and must run on the main/GUI thread, but is all O(1)/cheap, so
+        # doing it synchronously in __init__ is not what was freezing the
+        # GUI. TileMatrixSet/OccupancyIndex construction below, by
+        # contrast, walks every feature of every rendered layer and is
+        # genuinely slow at deep zoom levels (more, smaller tiles per
+        # feature) - that is what must NOT run on the calling thread.
+        self.tile_matrix_set: Optional["TileMatrixSet"] = None
+        self.occupancy_index: Optional["OccupancyIndex"] = None
+        self._prepared = False
+
+        # Per-thread stats, aggregated once at the end of export() instead
+        # of taking a shared lock on every single tile. See `_ThreadStats`
+        # and `_thread_stats()`.
+        self._stats_registry_lock = threading.Lock()
+        self._stats_registry: List[_ThreadStats] = []
+        self._stats_local = threading.local()
+        self._tiles_written = 0
+        self._tiles_skipped_empty = 0
+        self._tiles_failed = 0
+
+    def _prepare(self) -> None:
+        """Builds the TileMatrixSet and OccupancyIndex - the genuinely
+        slow, but thread-safe-to-defer, part of setting up an export.
+
+        This is deliberately NOT part of __init__. `XyzGpkgExporter(...)`
+        is what `run_in_background()` (and code calling it directly) runs
+        synchronously on the calling thread; if this feature-scanning work
+        lived in __init__, a deep zoom range (more, smaller tiles per
+        feature) would still block the GUI for however long it takes to
+        finish, even though the actual tile *rendering* was already
+        correctly backgrounded. Calling this from the top of export()
+        instead means it runs on whatever thread calls export() - the
+        QgsTask worker thread when using run_in_background(), which is
+        exactly where expensive, GUI-independent feature/geometry work
+        belongs. Reading vector features and building plain Python/QGIS
+        core geometry objects (no widget or labeling-engine-settings
+        access) is safe from a background thread; this deferral relies on
+        that split staying accurate, so do not add GUI/iface/canvas access
+        into OccupancyIndex or TileMatrixSet."""
+        if self._prepared:
+            return
+
         self.tile_matrix_set = TileMatrixSet(self.dest_crs, self.min_zoom, self.max_zoom)
         for zoom in range(self.min_zoom, self.max_zoom + 1):
             self._logger.info(
@@ -1158,9 +1230,6 @@ class XyzGpkgExporter:
                 zoom, self.tile_matrix_set.matrix(zoom).extent().toString(),
                 self.tile_matrix_set.matrix_dims(zoom),
             )
-
-        self._resolve_layers_and_theme()
-        self._logger.info("Resolved %d layer(s) for rendering", len(self.layers))
 
         # Built from the *actual* per-feature geometry of the layers that
         # will be rendered (not just their bounding boxes) - see
@@ -1173,26 +1242,9 @@ class XyzGpkgExporter:
         # real content start turning up unexpectedly empty.
         self.occupancy_index = OccupancyIndex(
             self.project, self.layers, self.dest_crs, self.tile_matrix_set, self.extent,
-            self.min_zoom, self.max_zoom, self._logger, tile_buffer=occupancy_tile_buffer,
+            self.min_zoom, self.max_zoom, self._logger, tile_buffer=self._occupancy_tile_buffer,
         )
-
-        expr_context = QgsExpressionContext()
-        expr_context.appendScope(QgsExpressionContextUtils.globalScope())
-        expr_context.appendScope(QgsExpressionContextUtils.projectScope(self.project))
-        self.expr_context = expr_context
-
-        self.progress_callback = progress_callback
-        self.should_cancel = should_cancel
-
-        # Per-thread stats, aggregated once at the end of export() instead
-        # of taking a shared lock on every single tile. See `_ThreadStats`
-        # and `_thread_stats()`.
-        self._stats_registry_lock = threading.Lock()
-        self._stats_registry: List[_ThreadStats] = []
-        self._stats_local = threading.local()
-        self._tiles_written = 0
-        self._tiles_skipped_empty = 0
-        self._tiles_failed = 0
+        self._prepared = True
 
     def _canvas_extent_or_none(self) -> Optional[QgsRectangle]:
         try:
@@ -1287,6 +1339,11 @@ class XyzGpkgExporter:
     def export(self) -> str:
         """Runs the export and returns the path to the produced GeoPackage."""
         self._logger.info("Starting export to %s", self.output_path)
+        # Heavy, deferred setup - see _prepare() docstring for why this is
+        # not in __init__. When called via run_in_background(), this
+        # entire method (including this call) runs on a QgsTask worker
+        # thread, never the GUI thread.
+        self._prepare()
         writer = GeoPackageWriter(
             self.output_path,
             table_name="xyz_tiles",
@@ -1410,12 +1467,18 @@ class XyzGpkgExporter:
         `__init__`) and submits it to QGIS's global task manager,
         returning immediately.
 
-        Unlike calling `XyzGpkgExporter(**kwargs).export()` directly - which
-        blocks whatever thread calls it for the entire export, freezing the
-        QGIS GUI if called from the main thread - this runs the whole
-        export inside a QgsTask on a background thread, so the GUI (canvas,
-        other plugins, the task manager's own Cancel button) stays fully
-        usable for the whole run.
+        `cls(**kwargs)` here only runs __init__'s cheap, main-thread-bound
+        setup (theme/layer resolution, labeling engine settings) - the
+        expensive per-feature occupancy build is deferred until export()
+        actually starts (see XyzGpkgExporter._prepare()), which happens
+        entirely inside the QgsTask below. So unlike calling
+        `XyzGpkgExporter(**kwargs).export()` directly - which blocks
+        whatever thread calls it, GUI included, for the *entire* export,
+        occupancy build and all - this call returns to the caller almost
+        immediately, and every slow part of the run (building the occupied-
+        tile set, then rendering it) happens on a background thread. The
+        GUI (canvas, other plugins, the task manager's own Cancel button)
+        stays fully usable for the whole run, at every zoom range.
 
         `on_finished(success, output_path, error)`, if given, is invoked on
         the main thread once the task completes, fails, or is cancelled."""
