@@ -69,11 +69,45 @@ a single run, so per-tile overhead is optimised aggressively):
     proportional to worker count rather than to total tile count - a
     multi-million-tile export no longer needs to hold millions of Future
     objects in memory simultaneously.
-  * EmptyTileDetector short-circuits on a single cheap bounding-box test
-    against the union of all layer extents before falling back to the
-    full per-layer intersection loop, so the (typically dominant, at low
-    zoom levels covering large regions of no data) fully-empty case costs
-    O(1) instead of O(layer count).
+  * The scale denominator at zoom 0 is computed exactly once (it is a
+    function of dpi/tile size only, both fixed for the whole export), then
+    every other zoom's scale is simply that value divided by 2**zoom - no
+    per-zoom trip through the equatorial-degrees-to-metres formula, since
+    this tile matrix is an exact quadtree where tile width at zoom z is by
+    definition the zoom-0 tile width halved z times.
+  * OccupancyIndex precomputes exactly which tiles contain feature content
+    - from each vector feature's own geometry bounding box, not just each
+    layer's overall extent - once at the finest requested zoom level, then
+    folds that up to every coarser zoom via exact quadtree parent
+    aggregation. Raster/basemap layers (e.g. an orthophoto background) are
+    deliberately NOT allowed to force their whole extent into the occupied
+    set: only vector layers drive which tiles get scheduled, and a raster
+    is treated purely as content painted *into* whichever tiles the vector
+    data already earned - never as a reason to schedule additional tiles.
+    (The whole-extent fallback is still used, but only as a last resort if
+    literally no vector layer contributed anything, so a pure-basemap
+    export still produces something.) The tile scheduler iterates *only*
+    this precomputed occupied-tile set: there is no walk over the full
+    zoom/col/row grid and no per-tile emptiness check at render time. This
+    is what actually keeps runtime proportional to real work rather than
+    to extent size - a bbox-only (or full-grid-walk-plus-filter, or an
+    occupancy set that a full-coverage raster is allowed to inflate back
+    up to nearly the whole grid) approach gets *proportionally* worse at
+    high zoom levels for sparse vector data over a wide background, since a
+    shrinking fraction of each tile within that bbox is genuinely occupied
+    as tiles get smaller. See the OccupancyIndex class docstring for full
+    details.
+  * The whole export can be run inside a QgsTask (XyzGpkgExporter.
+    run_in_background()) instead of being called synchronously from the
+    caller's own thread. XyzGpkgExporter already parallelizes tile
+    rendering across a ThreadPoolExecutor internally, but that only kept
+    *rendering* off any single thread - if export() were still invoked
+    directly from the main/GUI thread, that thread blocked synchronously
+    waiting on the pool for the whole run, freezing the QGIS GUI/event
+    loop for however long the export took. Running the whole export() call
+    inside a QgsTask fixes that: QgsTask.run() executes on a Qt-managed
+    background thread, so the GUI stays fully responsive (panning,
+    zooming, other plugins, a real Cancel button) for the entire run.
 """
 
 import os
@@ -85,7 +119,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
-from qgis.utils import iface
+
 from qgis.core import (
     Qgis,
     QgsProject,
@@ -102,7 +136,14 @@ from qgis.core import (
     QgsExpressionContextScope,
     QgsExpressionContextUtils,
     QgsLabelingEngineSettings,
+    QgsVectorLayer,
+    QgsFeatureRequest,
 )
+try:
+    from qgis.core import QgsTask, QgsApplication
+except ImportError:  # pragma: no cover - only missing in non-QGIS test environments
+    QgsTask = None
+    QgsApplication = None
 from qgis.PyQt.QtCore import QSize, QBuffer, QIODevice
 from qgis.PyQt.QtGui import QImage, QPainter, QColor
 
@@ -112,6 +153,19 @@ METERS_PER_DEGREE_EQUATOR = EARTH_CIRCUMFERENCE_M / 360.0
 INCH_METERS = 0.0254
 QIMAGE_NATIVE_FORMATS = {"PNG", "JPEG", "JPG", "WEBP"}
 LOG_TAG = "XyzGpkgExporter"
+
+# This custom tile matrix matches GoogleCRS84Quad: a zoom-0 matrix is 2
+# columns x 1 row spanning the full globe (-180,-90 : 180,90), so a single
+# zoom-0 tile is exactly 90 degrees wide/tall, and every deeper zoom's tile
+# width is that 90 degrees halved once per zoom level (strict quadtree).
+# TileMatrixSet uses these to build each QgsTileMatrix; TileRenderer uses
+# ZOOM0_TILE_WIDTH_DEGREES once to seed its scale-at-zoom-0 baseline, then
+# only ever divides by 2**zoom afterwards - see TileRenderer._scale_for_zoom.
+TILE_MATRIX_TILE_ORIGIN = QgsPointXY(-180.0, 90.0)
+TILE_MATRIX_Z0_DIMENSION_DEGREES = 180.0
+TILE_MATRIX_ROOT_WIDTH = 2
+TILE_MATRIX_ROOT_HEIGHT = 1
+ZOOM0_TILE_WIDTH_DEGREES = TILE_MATRIX_Z0_DIMENSION_DEGREES / TILE_MATRIX_ROOT_WIDTH
 
 # Constant value-objects reused across every tile render instead of being
 # reconstructed millions of times. Both are read-only from this module's
@@ -252,14 +306,14 @@ class TileMatrixSet:
     def __init__(self, crs: QgsCoordinateReferenceSystem, min_zoom: int, max_zoom: int):
         self._crs = crs
         self._min_zoom = min_zoom
-        self._tile_origin = QgsPointXY(-180.0, 90.0)
+        self._tile_origin = TILE_MATRIX_TILE_ORIGIN
         # z0Dimension is the side length (map units) of ONE root tile at zoom 0,
         # not a tile count. 180.0 degrees x 2 columns x 1 row = full globe
         # (-180,-90 : 180,90) at every zoom level, with every tile perfectly
         # square (strict 1:1 aspect ratio), matching GoogleCRS84Quad.
-        self._z0_dimension = 180.0
-        self._root_matrix_width = 2
-        self._root_matrix_height = 1
+        self._z0_dimension = TILE_MATRIX_Z0_DIMENSION_DEGREES
+        self._root_matrix_width = TILE_MATRIX_ROOT_WIDTH
+        self._root_matrix_height = TILE_MATRIX_ROOT_HEIGHT
         self._matrices: List[QgsTileMatrix] = [
             QgsTileMatrix.fromCustomDef(
                 zoom, self._crs, self._tile_origin,
@@ -284,82 +338,296 @@ class TileMatrixSet:
         return self._matrices[zoom - self._min_zoom].tileExtent(QgsTileXYZ(col, row, zoom))
 
 
-class EmptyTileDetector:
-    """Cheap pre-render extent-based intersection test used to skip tiles
-    that cannot contain any visible content, avoiding wasted rendering and
-    empty rows in the output GeoPackage.
+class OccupancyIndex:
+    """Precomputed set of tile coordinates that actually contain rendered
+    content, at every requested zoom level. The tile scheduler in
+    XyzGpkgExporter iterates *only* these tiles - there is no walk over
+    the full zoom/col/row grid and no per-tile emptiness check at render
+    time, so tiles with nothing to render are never even iterated, let
+    alone rendered.
 
-    Fails loudly (rather than silently) if no usable layer extent could be
-    built at all, since that previously caused every tile in the export to
-    be misclassified as empty, producing a schema-only GeoPackage."""
+    A cheaper whole-layer-bounding-box test was tried first and rejected:
+    for a large export extent containing few, scattered features (e.g. a
+    handful of polygon outlines/lines/labels over many square kilometres),
+    a layer's overall bounding box covers almost the entire export area
+    even though the actual rendered content only touches a small fraction
+    of it, and that mismatch gets worse every zoom level (tile count grows
+    4x per zoom, but the genuinely-occupied fraction of the bbox does
+    not) - this is what turned "a few minutes" into "hours" going from one
+    zoom level to the next.
 
-    def __init__(self, project: QgsProject, dest_crs: QgsCoordinateReferenceSystem, logger: logging.Logger):
-        self._layer_extents: List[QgsRectangle] = []
+    Instead, this builds an exact occupied-tile set from every feature's
+    own geometry bounding box (not the layer's overall extent), computed
+    once at the *finest* requested zoom level via
+    QgsTileMatrix.tileRangeFromExtent() (the same single-source-of-truth
+    tile math used everywhere else in this file), padded outward by
+    `tile_buffer` tiles to account for rendered content - symbol size,
+    line width, label placement - extending beyond a feature's bare
+    geometry bounds, and clamped to the requested export extent. Coarser
+    zoom levels are then derived for free by mapping each occupied (col,
+    row) down to its parent (col // 2, row // 2): this tile matrix is a
+    strict quadtree (each zoom's matrix dimensions are exactly double the
+    previous one in both directions), so a coarser tile is occupied iff at
+    least one of its finer descendants is - this is exact, not an
+    approximation, and costs O(occupied tile count) once rather than
+    O(feature count) per zoom level.
+
+    Layers without per-feature geometry to inspect (rasters, or any vector
+    layer whose feature scan fails or finds nothing within the export
+    extent) do NOT get their whole extent folded into the occupied set as
+    part of the normal per-layer pass. A raster background (e.g. an
+    orthophoto) legitimately covers its entire extent with real content,
+    but letting that force every tile in that extent into the occupied set
+    would defeat the entire point of this class for the common "sparse
+    vector overlay on a wide raster basemap" project - the raster would
+    single-handedly reinstate the "render nearly every tile in the bbox"
+    behaviour this class exists to avoid. Instead, area-covering layers are
+    only used as a last-resort fallback, applied once, after every layer
+    has been scanned, and only if literally nothing else contributed any
+    occupied tiles at all (e.g. a project with no vector layers) - so a
+    pure-basemap export still produces something, but a mixed project's
+    tile count is driven entirely by where the vector data actually is.
+
+    Fails loudly (rather than silently) if no usable occupied tile could
+    be built at all, since that previously caused every tile in the
+    export to be misclassified as empty, producing a schema-only
+    GeoPackage."""
+
+    def __init__(
+        self,
+        project: QgsProject,
+        layers: List,
+        dest_crs: QgsCoordinateReferenceSystem,
+        tile_matrix_set: "TileMatrixSet",
+        export_extent: QgsRectangle,
+        min_zoom: int,
+        max_zoom: int,
+        logger: logging.Logger,
+        tile_buffer: int = 1,
+    ):
+        self._min_zoom = min_zoom
+        self._max_zoom = max_zoom
         transform_context = project.transformContext()
+        finest_matrix = tile_matrix_set.matrix(max_zoom)
+        finest_w, finest_h = tile_matrix_set.matrix_dims(max_zoom)
+
+        # Clamp bounds derived once from the caller's actual export
+        # extent (not the full -180/-90/180/90 tile matrix): every mark
+        # operation below clips into this box, so the resulting occupied
+        # set can never contain a tile outside what was actually
+        # requested, and the scheduler can iterate it directly with no
+        # further extent filtering needed.
+        export_range = finest_matrix.tileRangeFromExtent(export_extent)
+        if not export_range.isValid():
+            raise RuntimeError(
+                "OccupancyIndex: the export extent does not intersect the tile matrix at all - "
+                "nothing could possibly be rendered. Check the requested extent/zoom range."
+            )
+        clamp_col_min = max(0, export_range.startColumn())
+        clamp_col_max = min(finest_w - 1, export_range.endColumn())
+        clamp_row_min = max(0, export_range.startRow())
+        clamp_row_max = min(finest_h - 1, export_range.endRow())
+        clamp_bounds = (clamp_col_min, clamp_col_max, clamp_row_min, clamp_row_max)
+
+        occupied: set = set()
+        area_extents: List[QgsRectangle] = []
+        usable_layers = 0
         layer_count = 0
-        for layer in project.mapLayers().values():
+
+        for layer in layers:
             layer_count += 1
             try:
                 if layer is None or not layer.isValid():
-                    logger.warning("EmptyTileDetector: layer '%s' invalid or None, skipping",
+                    logger.warning("OccupancyIndex: layer '%s' invalid or None, skipping",
                                    layer.name() if layer else "?")
                     continue
-                extent = layer.extent()
-                if extent is None or extent.isEmpty():
-                    logger.warning("EmptyTileDetector: layer '%s' has empty extent, skipping", layer.name())
+                layer_extent = layer.extent()
+                if layer_extent is None or layer_extent.isEmpty():
+                    logger.warning("OccupancyIndex: layer '%s' has empty extent, skipping", layer.name())
                     continue
+
                 src_crs = layer.crs()
-                if src_crs != dest_crs:
-                    transform = QgsCoordinateTransform(src_crs, dest_crs, transform_context)
-                    extent = transform.transformBoundingBox(extent)
-                self._layer_extents.append(extent)
+                transform = QgsCoordinateTransform(src_crs, dest_crs, transform_context) if src_crs != dest_crs else None
+                layer_extent_dest = transform.transformBoundingBox(layer_extent) if transform is not None else layer_extent
+
+                if isinstance(layer, QgsVectorLayer) and layer.isSpatial():
+                    added = self._mark_features(
+                        layer, transform, transform_context, finest_matrix,
+                        export_extent, clamp_bounds, tile_buffer, occupied, logger,
+                    )
+                    if not added:
+                        # No features intersected the export extent (or
+                        # the scan failed) - this vector layer contributes
+                        # nothing here. Its extent is still recorded as a
+                        # candidate area extent (below), in case NOTHING
+                        # in the whole project ends up contributing any
+                        # occupied tile at all.
+                        area_extents.append(layer_extent_dest)
+                else:
+                    # Raster / non-geometry layer: deliberately NOT folded
+                    # into the occupied set here - see class docstring.
+                    # It only becomes a fallback candidate, used at most
+                    # once, after every layer has been scanned.
+                    area_extents.append(layer_extent_dest)
+
+                usable_layers += 1
             except Exception as exc:
                 logger.warning(
-                    "EmptyTileDetector: skipping layer '%s' due to error: %s\n%s",
+                    "OccupancyIndex: skipping layer '%s' due to error: %s\n%s",
                     layer.name() if layer else "?", exc, traceback.format_exc(),
                 )
 
         if layer_count == 0:
-            logger.warning("EmptyTileDetector: project has no layers at all - every tile will be treated as empty.")
-        elif not self._layer_extents:
+            logger.warning("OccupancyIndex: project has no layers at all - nothing will be rendered.")
+        elif usable_layers == 0:
             raise RuntimeError(
-                "EmptyTileDetector: no usable layer extents could be built from any of the "
+                "OccupancyIndex: no usable layers could be read from any of the "
                 f"{layer_count} project layer(s). Every tile would be misclassified as empty, "
                 "producing a schema-only GeoPackage. Check the layers' CRS/extent validity."
             )
+        elif not occupied:
+            # No vector layer contributed a single occupied tile (e.g. a
+            # purely raster/basemap project, or one where every vector
+            # layer's feature scan failed) - fall back to the union of
+            # area-layer extents just this once, so a legitimate
+            # raster-only export still produces something instead of
+            # raising or silently producing nothing.
+            logger.warning(
+                "OccupancyIndex: no vector layer contributed any occupied tile - falling back to "
+                "%d area-layer extent(s) as a last resort", len(area_extents),
+            )
+            for area_extent in area_extents:
+                self._mark_extent(area_extent, finest_matrix, clamp_bounds, occupied)
+            if not occupied:
+                raise RuntimeError(
+                    "OccupancyIndex: no usable occupied tiles could be built from any of the "
+                    f"{layer_count} project layer(s), including the area-extent fallback. Every "
+                    "tile would be misclassified as empty, producing a schema-only GeoPackage. "
+                    "Check the layers' CRS/extent validity."
+                )
+            logger.info(
+                "OccupancyIndex: %d occupied tile(s) at zoom %d built from area-extent fallback only",
+                len(occupied), max_zoom,
+            )
         else:
-            logger.info("EmptyTileDetector: built %d usable layer extent(s) out of %d layer(s)",
-                        len(self._layer_extents), layer_count)
+            logger.info(
+                "OccupancyIndex: %d occupied tile(s) at zoom %d built from vector feature geometry "
+                "(%d area/raster layer(s) present but excluded from occupancy - see class docstring)",
+                len(occupied), max_zoom, len(area_extents),
+            )
 
-        # Pre-compute the union bounding box of every layer extent once.
-        # On the per-tile hot path this lets us reject the overwhelmingly
-        # common "tile has no data at all" case (especially at low zoom
-        # levels, where most of a multi-million-tile export's tiles cover
-        # ocean/empty space) with a single O(1) rectangle test, instead of
-        # unconditionally looping over every layer extent.
-        self._single_extent = self._layer_extents[0] if len(self._layer_extents) == 1 else None
-        self._union_extent: Optional[QgsRectangle] = None
-        for extent in self._layer_extents:
-            if self._union_extent is None:
-                self._union_extent = QgsRectangle(extent)
+        # Fold the finest-zoom occupied set up to every coarser zoom by
+        # quadtree parent aggregation - see class docstring. Stored as a
+        # list indexed by `zoom - min_zoom`, matching TileMatrixSet, so the
+        # scheduler can iterate `occupied_tiles(zoom)` directly for every
+        # zoom without recomputing anything.
+        levels = [None] * (max_zoom - min_zoom + 1)
+        levels[max_zoom - min_zoom] = occupied
+        current = occupied
+        for zoom in range(max_zoom - 1, min_zoom - 1, -1):
+            current = {(c >> 1, r >> 1) for (c, r) in current}
+            levels[zoom - min_zoom] = current
+        self._occupied_by_zoom: List[set] = levels
+        self.total_tile_count = sum(len(s) for s in levels)
+        for zoom in range(min_zoom, max_zoom + 1):
+            logger.info("Zoom %d: %d occupied tile(s) scheduled", zoom, len(levels[zoom - min_zoom]))
+
+    @staticmethod
+    def _clip_to_bounds(start_col: int, end_col: int, start_row: int, end_row: int, clamp_bounds: Tuple[int, int, int, int]):
+        clamp_col_min, clamp_col_max, clamp_row_min, clamp_row_max = clamp_bounds
+        start_col = max(clamp_col_min, start_col)
+        end_col = min(clamp_col_max, end_col)
+        start_row = max(clamp_row_min, start_row)
+        end_row = min(clamp_row_max, end_row)
+        if start_col > end_col or start_row > end_row:
+            return None
+        return start_col, end_col, start_row, end_row
+
+    @classmethod
+    def _mark_extent(cls, extent_dest: QgsRectangle, finest_matrix: QgsTileMatrix, clamp_bounds: Tuple[int, int, int, int], occupied: set) -> None:
+        tile_range = finest_matrix.tileRangeFromExtent(extent_dest)
+        if not tile_range.isValid():
+            return
+        clipped = cls._clip_to_bounds(
+            tile_range.startColumn(), tile_range.endColumn(), tile_range.startRow(), tile_range.endRow(), clamp_bounds,
+        )
+        if clipped is None:
+            return
+        start_col, end_col, start_row, end_row = clipped
+        for col in range(start_col, end_col + 1):
+            for row in range(start_row, end_row + 1):
+                occupied.add((col, row))
+
+    def _mark_features(
+        self,
+        layer,
+        transform: Optional[QgsCoordinateTransform],
+        transform_context,
+        finest_matrix: QgsTileMatrix,
+        export_extent: QgsRectangle,
+        clamp_bounds: Tuple[int, int, int, int],
+        tile_buffer: int,
+        occupied: set,
+        logger: logging.Logger,
+    ) -> bool:
+        """Scans every feature intersecting the export extent, marking the
+        (padded, clamped) occupied tile block for each feature's own
+        geometry bounding box. Returns True if at least one feature was
+        processed (even if it produced zero occupied tiles, e.g. a
+        degenerate geometry) so the caller knows a real scan happened."""
+        src_crs = layer.crs()
+        try:
+            request = QgsFeatureRequest()
+            request.setSubsetOfAttributes([])
+            # Restrict the scan to the actual export extent (not the whole
+            # globe-spanning tile matrix), in the layer's own CRS, so the
+            # provider's spatial index does the heavy lifting and we never
+            # even look at features far outside what's being exported.
+            if transform is not None:
+                reverse_transform = QgsCoordinateTransform(finest_matrix.crs(), src_crs, transform_context)
+                request.setFilterRect(reverse_transform.transformBoundingBox(export_extent))
             else:
-                self._union_extent.combineExtentWith(extent)
+                request.setFilterRect(export_extent)
+        except Exception:
+            request = QgsFeatureRequest()
+            request.setSubsetOfAttributes([])
 
-    def is_empty(self, tile_extent: QgsRectangle) -> bool:
-        # Common special case: a single source layer - the union extent
-        # *is* that layer's extent, so skip the redundant duplicate test.
-        single = self._single_extent
-        if single is not None:
-            return not single.intersects(tile_extent)
+        processed = False
+        try:
+            for feature in layer.getFeatures(request):
+                geom = feature.geometry()
+                if geom is None or geom.isEmpty():
+                    continue
+                processed = True
+                feat_extent = geom.boundingBox()
+                if feat_extent is None or feat_extent.isEmpty():
+                    continue
+                feat_extent_dest = transform.transformBoundingBox(feat_extent) if transform is not None else feat_extent
+                tile_range = finest_matrix.tileRangeFromExtent(feat_extent_dest)
+                if not tile_range.isValid():
+                    continue
+                clipped = self._clip_to_bounds(
+                    tile_range.startColumn() - tile_buffer, tile_range.endColumn() + tile_buffer,
+                    tile_range.startRow() - tile_buffer, tile_range.endRow() + tile_buffer,
+                    clamp_bounds,
+                )
+                if clipped is None:
+                    continue
+                start_col, end_col, start_row, end_row = clipped
+                for col in range(start_col, end_col + 1):
+                    for row in range(start_row, end_row + 1):
+                        occupied.add((col, row))
+        except Exception as exc:
+            logger.warning(
+                "OccupancyIndex: feature scan failed for layer '%s', falling back to whole-layer extent (%s)",
+                layer.name(), exc,
+            )
+            return False
+        return processed
 
-        union = self._union_extent
-        if union is None or not union.intersects(tile_extent):
-            return True
-
-        for extent in self._layer_extents:
-            if extent.intersects(tile_extent):
-                return False
-        return True
+    def occupied_tiles(self, zoom: int) -> set:
+        """The set of (col, row) tuples with real content at this zoom."""
+        return self._occupied_by_zoom[zoom - self._min_zoom]
 
 
 class GeoPackageWriter:
@@ -646,15 +914,22 @@ class TileRenderer:
         self._qt_save_format = "JPG" if self._format == "JPEG" else self._format
 
         # Output size/dpi are fixed for the whole export, so the
-        # dpi-dependent half of the equator-scale formula - the "paper"
-        # width in metres - is invariant and computed once here, instead
-        # of on every single tile. Combined with `_scale_cache` below, the
-        # per-tile scale computation degrades from "float division on
-        # every tile" to "one dict lookup per tile, one float division per
-        # zoom level" - every tile at a given zoom is the same width in
-        # this uniform, non-adaptive tile grid, so the scale is provably
-        # identical for every tile sharing a zoom level.
+        # dpi-dependent "paper" width in metres is invariant and computed
+        # once here. The scale denominator at zoom 0 is then computed
+        # exactly ONCE from that (the only place `_equatorial_scale_denominator`
+        # / EARTH_CIRCUMFERENCE_M are used at all) - every other zoom's
+        # scale is just that single number divided by 2**zoom, since this
+        # tile matrix is an exact quadtree: a tile at zoom z is by
+        # definition the zoom-0 tile halved z times, so its scale
+        # denominator (which is directly proportional to tile width) halves
+        # right along with it. This replaces the old "recompute the
+        # equatorial formula per zoom" with "one baseline calculation for
+        # the whole export, then integer-power-of-two division" - the
+        # actual per-tile/per-zoom cost was already O(1) either way (both
+        # are cached in `_scale_cache`), so this is a clarity/redundancy
+        # fix rather than a hot-path optimisation.
         self._paper_width_m = (TILE_SIZE / float(dpi)) * INCH_METERS
+        self._scale_zoom0 = _equatorial_scale_denominator(ZOOM0_TILE_WIDTH_DEGREES, self._paper_width_m)
         self._scale_cache: Dict[int, float] = {}
 
         # Cache flag enum members once: three fewer nested attribute
@@ -744,15 +1019,17 @@ class TileRenderer:
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         return buf
 
-    def _scale_for_zoom(self, zoom: int, extent: QgsRectangle) -> float:
+    def _scale_for_zoom(self, zoom: int) -> float:
         cached = self._scale_cache.get(zoom)
         if cached is not None:
             return cached
-        value = _equatorial_scale_denominator(extent.width(), self._paper_width_m)
-        # Deterministic value - a benign race between threads computing
-        # the same zoom's scale for the first time simultaneously is safe
-        # (last write wins, both writes are equal), and avoids needing a
-        # lock on this per-tile-adjacent hot path.
+        # Pure quadtree halving from the single zoom-0 baseline - no
+        # extent/degrees lookup, no repeated call into the equatorial
+        # formula. Deterministic value - a benign race between threads
+        # computing the same zoom's scale for the first time
+        # simultaneously is safe (last write wins, both writes are equal),
+        # and avoids needing a lock on this per-tile-adjacent hot path.
+        value = self._scale_zoom0 / (2 ** zoom)
         self._scale_cache[zoom] = value
         return value
 
@@ -788,10 +1065,10 @@ class TileRenderer:
         settings.setFlag(self._flag_render_tile, True)
         settings.setFlag(self._flag_advanced_effects, True)
 
-        # Equator-based scale: identical for every tile within a zoom
-        # level (uniform grid), so this is a cache lookup after the first
-        # tile of each zoom rather than a fresh computation every time.
-        equator_scale = self._scale_for_zoom(zoom, extent)
+        # Zoom-0-baseline-halved scale: identical for every tile within a
+        # zoom level (uniform grid), a cache lookup after the first tile
+        # of each zoom.
+        equator_scale = self._scale_for_zoom(zoom)
         ctx, scale_scope = self._thread_expr_context()
         scale_scope.setVariable("map_scale", equator_scale, True)
         settings.setExpressionContext(ctx)
@@ -824,12 +1101,11 @@ class XyzGpkgExporter:
         output_dir: str = ".",
         progress_callback: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
+        occupancy_tile_buffer: int = 1,
     ):
         self._logger = _make_logger()
         self.project = QgsProject.instance()
         self.dest_crs = QgsCoordinateReferenceSystem("EPSG:4326")
-        screen = iface.mainWindow().windowHandle().screen()
-        self.dpi = dpi*screen.devicePixelRatio()
 
         if extent is None:
             extent = self._canvas_extent_or_none()
@@ -839,7 +1115,7 @@ class XyzGpkgExporter:
             raise ValueError("Invalid zoom range: max_zoom must be >= min_zoom >= 0")
         self.min_zoom = min_zoom
         self.max_zoom = max_zoom
-        
+        self.dpi = dpi
         self.max_cpu_percent = max(1, min(100, max_cpu_percent))
         self.tile_format = tile_format.upper()
         self.quality = max(0, min(100, quality))
@@ -883,9 +1159,22 @@ class XyzGpkgExporter:
                 self.tile_matrix_set.matrix_dims(zoom),
             )
 
-        self.empty_detector = EmptyTileDetector(self.project, self.dest_crs, self._logger)
         self._resolve_layers_and_theme()
         self._logger.info("Resolved %d layer(s) for rendering", len(self.layers))
+
+        # Built from the *actual* per-feature geometry of the layers that
+        # will be rendered (not just their bounding boxes) - see
+        # OccupancyIndex docstring for why this matters at high zoom
+        # levels. `occupancy_tile_buffer` pads every feature's occupied
+        # tile block by this many tiles in each direction to account for
+        # rendered content (symbol size, line width, label placement)
+        # extending beyond the bare geometry bounds; raise it if a project
+        # uses unusually large point markers/label offsets and tiles near
+        # real content start turning up unexpectedly empty.
+        self.occupancy_index = OccupancyIndex(
+            self.project, self.layers, self.dest_crs, self.tile_matrix_set, self.extent,
+            self.min_zoom, self.max_zoom, self._logger, tile_buffer=occupancy_tile_buffer,
+        )
 
         expr_context = QgsExpressionContext()
         expr_context.appendScope(QgsExpressionContextUtils.globalScope())
@@ -907,6 +1196,8 @@ class XyzGpkgExporter:
 
     def _canvas_extent_or_none(self) -> Optional[QgsRectangle]:
         try:
+            from qgis.utils import iface
+
             if iface is None or iface.mapCanvas() is None:
                 return None
             canvas = iface.mapCanvas()
@@ -941,56 +1232,27 @@ class XyzGpkgExporter:
             root = self.project.layerTreeRoot()
             self.layers = root.checkedLayers()
 
-    def _tile_range_for_extent(self, zoom: int, matrix_w: int, matrix_h: int) -> Tuple[int, int, int, int]:
-        # Used only to bound the iteration range; final tile bounds for
-        # rendering/writing always come from TileMatrixSet.tile_extent().
-        matrix_extent = self.tile_matrix_set.matrix(zoom).extent()
-        if not self.extent.intersects(matrix_extent):
-            return (0, 0, -1, -1)
-        clipped = self.extent.intersect(matrix_extent)
-        if clipped is None or clipped.isEmpty():
-            return (0, 0, -1, -1)
+    def _iter_occupied_tiles(self):
+        """Yields (zoom, col, row) directly from the precomputed
+        OccupancyIndex - the only tiles ever produced are ones already
+        known to contain real content. There is no walk over the full
+        zoom/col/row grid and no per-tile emptiness check: for a large
+        export extent with sparse features, the occupied set can be many
+        orders of magnitude smaller than the full grid, so this scheduling
+        step now costs O(occupied tiles) instead of O(every tile in the
+        extent).
 
-        tile_deg_w = matrix_extent.width() / matrix_w
-        tile_deg_h = matrix_extent.height() / matrix_h
-
-        min_col = int(math.floor((clipped.xMinimum() - matrix_extent.xMinimum()) / tile_deg_w))
-        max_col = int(math.floor((clipped.xMaximum() - matrix_extent.xMinimum()) / tile_deg_w))
-        # row 0 at top (north), increasing southward - standard XYZ/GPKG order.
-        min_row = int(math.floor((matrix_extent.yMaximum() - clipped.yMaximum()) / tile_deg_h))
-        max_row = int(math.floor((matrix_extent.yMaximum() - clipped.yMinimum()) / tile_deg_h))
-
-        min_col = max(0, min_col)
-        min_row = max(0, min_row)
-        max_col = min(matrix_w - 1, max_col)
-        max_row = min(matrix_h - 1, max_row)
-        return (min_col, min_row, max_col, max_row)
-
-    def _estimate_total_tiles(self) -> int:
-        total = 0
+        Kept as a generator (rather than materializing one combined list)
+        so that, combined with the bounded-in-flight submission pipeline
+        in export(), peak memory stays proportional to worker count."""
+        cancel_check_every = 256
+        counter = 0
         for zoom in range(self.min_zoom, self.max_zoom + 1):
-            matrix_w, matrix_h = self.tile_matrix_set.matrix_dims(zoom)
-            min_col, min_row, max_col, max_row = self._tile_range_for_extent(zoom, matrix_w, matrix_h)
-            if max_col >= min_col and max_row >= min_row:
-                total += (max_col - min_col + 1) * (max_row - min_row + 1)
-        return max(1, total)
-
-    def _iter_tile_coords(self):
-        """Lazily yields (zoom, col, row) tuples for every tile to render.
-        Kept as a generator (rather than materializing the full list) so
-        that, combined with the bounded-in-flight submission pipeline in
-        export(), peak memory never scales with total tile count."""
-        for zoom in range(self.min_zoom, self.max_zoom + 1):
-            matrix_w, matrix_h = self.tile_matrix_set.matrix_dims(zoom)
-            min_col, min_row, max_col, max_row = self._tile_range_for_extent(zoom, matrix_w, matrix_h)
-            if max_col < min_col or max_row < min_row:
-                self._logger.warning("Zoom %d: extent does not intersect this zoom's tile matrix", zoom)
-                continue
-            for row in range(min_row, max_row + 1):
-                if self.should_cancel and self.should_cancel():
+            for col, row in self.occupancy_index.occupied_tiles(zoom):
+                counter += 1
+                if self.should_cancel and counter % cancel_check_every == 0 and self.should_cancel():
                     return
-                for col in range(min_col, max_col + 1):
-                    yield zoom, col, row
+                yield zoom, col, row
 
     def _thread_stats(self) -> "_ThreadStats":
         tl = self._stats_local
@@ -1003,12 +1265,12 @@ class XyzGpkgExporter:
         return stats
 
     def _process_tile(self, renderer: TileRenderer, writer: GeoPackageWriter, zoom: int, col: int, row: int) -> None:
+        # No emptiness check here: only tiles the OccupancyIndex already
+        # knows are occupied are ever submitted (see _iter_occupied_tiles),
+        # so every call here does real, necessary work.
         stats = self._thread_stats()
         try:
             tile_extent = self.tile_matrix_set.tile_extent(zoom, col, row)
-            if self.empty_detector.is_empty(tile_extent):
-                stats.skipped += 1
-                return
             data = renderer.render_tile(zoom, tile_extent, self.dest_crs)
             if not data:
                 self._logger.warning("Tile z=%d x=%d y=%d rendered but produced no encoded bytes", zoom, col, row)
@@ -1048,8 +1310,14 @@ class XyzGpkgExporter:
 
         worker_count = _compute_worker_count(self.max_cpu_percent)
         self._logger.info("Using %d worker threads", worker_count)
-        total_estimate = self._estimate_total_tiles()
-        self._logger.info("Estimated total tiles to process: %d", total_estimate)
+        # Exact, not an estimate: this is precisely the number of tiles
+        # that will be submitted, since we now only ever iterate the
+        # OccupancyIndex's occupied-tile sets.
+        total_estimate = max(1, self.occupancy_index.total_tile_count)
+        self._logger.info(
+            "Tiles scheduled for rendering after occupancy filtering (across all zoom levels %d-%d): %d",
+            self.min_zoom, self.max_zoom, total_estimate,
+        )
         completed = 0
         # Bound how many tiles may be in flight (submitted-but-not-yet-
         # processed) at once, rather than submitting every tile up front.
@@ -1062,7 +1330,7 @@ class XyzGpkgExporter:
 
         try:
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="xyztile") as pool:
-                tile_iter = self._iter_tile_coords()
+                tile_iter = self._iter_occupied_tiles()
                 in_flight = set()
 
                 def _submit_next() -> bool:
@@ -1131,6 +1399,98 @@ class XyzGpkgExporter:
 
     def run(self) -> str:
         return self.export()
+
+    @classmethod
+    def run_in_background(
+        cls,
+        on_finished: Optional[Callable[[bool, Optional[str], Optional[str]], None]] = None,
+        **kwargs,
+    ) -> "XyzGpkgExporterTask":
+        """Builds an XyzGpkgExporter from `kwargs` (same arguments as
+        `__init__`) and submits it to QGIS's global task manager,
+        returning immediately.
+
+        Unlike calling `XyzGpkgExporter(**kwargs).export()` directly - which
+        blocks whatever thread calls it for the entire export, freezing the
+        QGIS GUI if called from the main thread - this runs the whole
+        export inside a QgsTask on a background thread, so the GUI (canvas,
+        other plugins, the task manager's own Cancel button) stays fully
+        usable for the whole run.
+
+        `on_finished(success, output_path, error)`, if given, is invoked on
+        the main thread once the task completes, fails, or is cancelled."""
+        if QgsTask is None or QgsApplication is None:
+            raise RuntimeError(
+                "QgsTask/QgsApplication are unavailable in this environment - "
+                "cannot run in the background here. Call export()/run() directly instead."
+            )
+        exporter = cls(**kwargs)
+        task = XyzGpkgExporterTask(exporter, on_finished=on_finished)
+        QgsApplication.taskManager().addTask(task)
+        return task
+
+
+class XyzGpkgExporterTask(QgsTask if QgsTask is not None else object):
+    """Runs XyzGpkgExporter.export() on a QgsTask background thread.
+
+    XyzGpkgExporter already parallelizes tile *rendering* across a
+    ThreadPoolExecutor internally, but that alone does not stop the GUI
+    from freezing: if `export()` is still called synchronously from the
+    main/GUI thread, that thread blocks in its own wait-loop for the whole
+    run, and a blocked main thread means a blocked Qt event loop - no
+    canvas redraw, no other plugin interaction, no way to click Cancel -
+    for however long the export takes (minutes to hours). QgsTask.run()
+    executes on a Qt-managed worker thread instead, so the main thread's
+    event loop is never touched and the GUI stays fully responsive for the
+    whole export. Prefer `XyzGpkgExporter.run_in_background(...)` over
+    constructing this directly - it wires everything up for you."""
+
+    def __init__(
+        self,
+        exporter: "XyzGpkgExporter",
+        on_finished: Optional[Callable[[bool, Optional[str], Optional[str]], None]] = None,
+    ):
+        description = f"Export XYZ tiles to GeoPackage (zoom {exporter.min_zoom}-{exporter.max_zoom})"
+        super().__init__(description, QgsTask.Flag.CanCancel)
+        self._exporter = exporter
+        self._on_finished = on_finished
+        self._error: Optional[str] = None
+        self._output_path: Optional[str] = None
+
+        # Wire the exporter's own progress/cancel hooks straight into this
+        # task's QgsTask progress reporting / isCanceled(), so QGIS's
+        # built-in task manager UI (progress bar, Cancel button in the
+        # status bar) drives and reflects the real export state - no
+        # separate polling loop needed on either side.
+        exporter.progress_callback = self._on_progress
+        exporter.should_cancel = self.isCanceled
+
+    def _on_progress(self, completed: int, total: int) -> None:
+        if total > 0:
+            self.setProgress(min(100.0, 100.0 * completed / total))
+
+    def run(self) -> bool:
+        # This executes on a QgsTask worker thread, never the main/GUI
+        # thread - see class docstring.
+        try:
+            self._output_path = self._exporter.export()
+            return not self.isCanceled()
+        except Exception as exc:
+            self._error = f"{exc}\n{traceback.format_exc()}"
+            return False
+
+    def finished(self, result: bool) -> None:
+        # finished() is called back on the main thread by QgsTaskManager,
+        # so it is safe to touch GUI-adjacent objects here if `on_finished`
+        # needs to (e.g. showing a message bar item).
+        if not result and self._error:
+            QgsMessageLog.logMessage(
+                f"XYZ tile export failed: {self._error}", LOG_TAG, Qgis.MessageLevel.Critical,
+            )
+        elif not result:
+            QgsMessageLog.logMessage("XYZ tile export was cancelled", LOG_TAG, Qgis.MessageLevel.Info)
+        if self._on_finished:
+            self._on_finished(result, self._output_path, self._error)
 
 
 class _ThreadStats:
