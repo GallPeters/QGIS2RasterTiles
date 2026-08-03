@@ -89,10 +89,44 @@ CORRECTNESS GUARANTEES (unchanged from the previous implementation)
   * The GeoPackage is written without WAL, so tile data can never be
     stranded in a `.gpkg-wal` side file.
 
-ONE DELIBERATE OUTPUT CHANGE
-============================
+METATILING
+==========
 
-`QgsMapThemeCollection.mapThemeStyleOverrides()` is keyed by layer ID, but
+Tiles are rendered in aligned square blocks of `metatile_size_px / TILE_SIZE`
+tiles (default 2048 px = 8x8 = 64 tiles) in a single
+`QgsMapRendererCustomPainterJob`, then sliced apart. See the METATILING block
+in the constants section for the full rationale. In short: one renderer setup,
+one label-engine run and one transform-cache pass per block instead of per
+tile; each feature drawn once per block instead of once per tile it overlaps;
+and a screen-sized label viewport instead of a 68 mm one.
+
+The scale denominator is unaffected - a block covers N times the ground width
+at N times the pixel width - so symbology and every scale-dependent rule
+evaluate exactly as they do per-tile. Only label placement changes, and it
+changes toward what the map canvas shows.
+
+Set `metatile_size_px = TILE_SIZE` to disable metatiling and restore
+one-job-per-tile rendering.
+
+
+OUTPUT CHANGES RELATIVE TO THE ORIGINAL IMPLEMENTATION
+======================================================
+
+Three, all deliberate:
+
+1. **Zoom-0 scale baseline corrected.** `QgsTileMatrix.fromCustomDef` takes
+   `z0Dimension` as the side length of one zoom-0 *tile*, not of the whole
+   matrix, so the zoom-0 tile span is 180 degrees, not 180/2 = 90. The old
+   value made every `map_scale` exactly half the true denominator, i.e. one
+   zoom level more "zoomed in" than reality, for every scale-dependent
+   symbology rule, label threshold and layer visibility range. The writer's
+   independent gpkg_tile_matrix maths corroborates 180 degrees per zoom-0
+   tile. Set `SCALE_DENOMINATOR_FACTOR = 0.5` to restore the old behaviour.
+
+2. **Label placement**, via metatiling, as described above.
+
+3. **Map theme style overrides now apply at all.**
+   `QgsMapThemeCollection.mapThemeStyleOverrides()` is keyed by layer ID, but
 the renderer feeds *cloned* layers, which have fresh IDs. The overrides
 therefore never matched and were silently ignored. They are now remapped
 onto each thread's clone IDs, so theme-based exports finally render the
@@ -102,14 +136,16 @@ style overrides; everything else is byte-for-byte unaffected.
 
 from __future__ import annotations
 
+import ctypes
+import logging
 import math
 import os
+import platform
 import queue
 import sqlite3
 import threading
 import time
 import traceback
-import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -142,7 +178,7 @@ except ImportError:  # pragma: no cover
     QgsApplication = None
     QgsTask = None
 
-from qgis.PyQt.QtCore import QBuffer, QIODevice, QSize
+from qgis.PyQt.QtCore import QBuffer, QIODevice, QSize, QThread
 from qgis.PyQt.QtGui import QColor, QImage, QPainter
 
 
@@ -152,34 +188,124 @@ from qgis.PyQt.QtGui import QColor, QImage, QPainter
 
 LOG_TAG = "XyzGpkgExporter"
 
-TILE_SIZE = 256
 EARTH_CIRCUMFERENCE_M = 40075016.6856
 METERS_PER_DEGREE_EQUATOR = EARTH_CIRCUMFERENCE_M / 360.0
 INCH_METERS = 0.0254
 
 QIMAGE_NATIVE_FORMATS = frozenset({"PNG", "JPEG", "JPG", "WEBP"})
 
-# GoogleCRS84Quad: zoom 0 is 2 columns x 1 row spanning the full globe, so a
-# zoom-0 tile is exactly 90 degrees square and every deeper zoom halves that
-# exactly once. This is a strict quadtree, which is what makes both the
-# scale-per-zoom shortcut and the occupancy parent-fold exact rather than
-# approximate.
-TILE_MATRIX_TILE_ORIGIN = QgsPointXY(-180.0, 90.0)
-TILE_MATRIX_Z0_DIMENSION_DEGREES = 180.0
-TILE_MATRIX_ROOT_WIDTH = 2
-TILE_MATRIX_ROOT_HEIGHT = 1
-ZOOM0_TILE_WIDTH_DEGREES = TILE_MATRIX_Z0_DIMENSION_DEGREES / TILE_MATRIX_ROOT_WIDTH
+
+# ==========================================================================
+# TILING SCHEME
+# ==========================================================================
+# Everything about the tile pyramid is defined here and nowhere else. Change
+# these five values and the tile matrices, the GeoPackage
+# gpkg_tile_matrix/gpkg_tile_matrix_set rows, the per-zoom scale denominators
+# and the occupancy quadtree fold all follow automatically.
+#
+# The defaults describe GoogleCRS84Quad: origin at the north-west corner of
+# the globe, a 2 x 1 root matrix, and one zoom-0 tile spanning 180 degrees
+# square. That gives a full-globe extent of -180,-90 : 180,90 at every zoom
+# with perfectly square tiles.
+#
+# IMPORTANT - the meaning of TILE_MATRIX_Z0_TILE_SPAN:
+#   QgsTileMatrix.fromCustomDef(zoom, crs, z0TopLeftPoint, z0Dimension,
+#                               z0MatrixWidth, z0MatrixHeight)
+#   takes z0Dimension as the side length of ONE zoom-0 TILE - not the width
+#   of the whole zoom-0 matrix. The matrix extent it produces is
+#   z0MatrixWidth * z0Dimension wide by z0MatrixHeight * z0Dimension tall.
+#   With the defaults below that is 2*180 = 360 degrees by 1*180 = 180
+#   degrees, i.e. the whole globe, and each zoom-0 tile is 180 degrees square.
+#
+#   This is why ZOOM0_TILE_SPAN_DEGREES below is TILE_MATRIX_Z0_TILE_SPAN
+#   itself and is NOT divided by TILE_MATRIX_ROOT_WIDTH. Earlier versions of
+#   this module divided by the root width, producing a zoom-0 tile span of 90
+#   degrees instead of 180 and therefore a `map_scale` denominator exactly
+#   half the true value at every zoom level - reporting one zoom level more
+#   "zoomed in" than reality to every scale-dependent symbology rule, label
+#   threshold and layer visibility range.
+#
+#   The writer's independent gpkg_tile_matrix maths corroborates 180: at zoom
+#   0 pixel_x_size = 360/2/256 = 0.703125 degrees per pixel, and
+#   0.703125 * 256 = 180 degrees per tile.
+#
+#   If you calibrated symbology rules by eye against the old, halved value,
+#   set SCALE_DENOMINATOR_FACTOR to 0.5 to reproduce it exactly.
+
+TILE_SIZE = 256                          # tile edge in pixels
+TILE_MATRIX_TILE_ORIGIN = QgsPointXY(-180.0, 90.0)   # north-west corner
+TILE_MATRIX_Z0_TILE_SPAN = 180.0         # side length of ONE zoom-0 tile, CRS units
+TILE_MATRIX_ROOT_WIDTH = 2               # zoom-0 matrix columns
+TILE_MATRIX_ROOT_HEIGHT = 1              # zoom-0 matrix rows  (2:1 = GoogleCRS84Quad)
+
+# Ground span of a single zoom-0 tile; every deeper zoom is this halved once
+# per level, because the matrix is a strict quadtree.
+ZOOM0_TILE_SPAN_DEGREES = TILE_MATRIX_Z0_TILE_SPAN
+
+# Multiplier applied to every computed scale denominator. Leave at 1.0 for
+# geometrically correct scales; set to 0.5 to reproduce the pre-fix values.
+SCALE_DENOMINATOR_FACTOR = 1.0
+
+# Tiles must be square for metatile slicing and for QgsMapSettings to accept
+# an extent without aspect-ratio adjustment. Fail loudly rather than produce
+# subtly misaligned tiles.
+if TILE_MATRIX_ROOT_WIDTH < 1 or TILE_MATRIX_ROOT_HEIGHT < 1:
+    raise ValueError("TILE_MATRIX_ROOT_WIDTH/HEIGHT must both be >= 1")
+
+# ==========================================================================
+
+
+# --------------------------------------------------------------------------
+# Metatiling
+# --------------------------------------------------------------------------
+# Tiles are rendered in aligned square blocks ("metatiles") of
+# METATILE_SIZE_PX / TILE_SIZE tiles per side, in ONE
+# QgsMapRendererCustomPainterJob, then sliced into individual tiles.
+#
+# Why this is both faster and more faithful:
+#   * One renderer setup, one label-engine run, one symbol-preparation pass
+#     and one set of coordinate-transform cache lookups per block instead of
+#     per tile. Those global QGIS/Qt locks are what starve the GUI thread, so
+#     touching them 64x less often is the single most effective
+#     responsiveness fix available.
+#   * A feature spanning several tiles is drawn ONCE per block rather than
+#     once per tile it overlaps. Per-tile rendering redraws it every time.
+#   * The label engine sees a screen-sized viewport instead of a 256 px one.
+#     With UsePartialCandidates off, a label is only placed if it fits
+#     entirely inside the render viewport, so a 256 px tile (about 68 mm at
+#     96 dpi) drops nearly every label and positions the survivors against a
+#     viewport nothing like the real map canvas. This is the main reason
+#     per-tile exports look unlike the project on screen.
+#
+# The scale denominator is NOT affected. A block covers N times the ground
+# width at N times the pixel width, so ground units per pixel - and therefore
+# the scale denominator - is identical to a single tile at the same zoom.
+# Symbol sizes, line widths and every scale-dependent rule evaluate exactly
+# as they do without metatiling. Only label placement changes.
+#
+# Interaction with the occupancy index: a block containing no occupied tile
+# is never rendered, and slicing emits ONLY the occupied sub-tiles, so the
+# set of rows written to the GeoPackage is unchanged. Sparsely occupied
+# blocks do rasterise some empty area, but empty-area fill is cheap next to
+# the per-tile setup and duplicated feature drawing it removes.
+#
+# Set the metatile size equal to TILE_SIZE to disable metatiling entirely and
+# get the previous one-job-per-tile behaviour.
+
+DEFAULT_METATILE_SIZE_PX = 2048
+MIN_METATILE_SIZE_PX = TILE_SIZE
+# 4096 px ARGB32 is 67 MB per worker thread; beyond that memory dominates.
+MAX_METATILE_SIZE_PX = 4096
 
 WORLD_EXTENT = QgsRectangle(-180.0, -90.0, 180.0, 90.0)
 
-# Immutable value objects reused for every tile. Qt setters copy these, so
+# Immutable value objects reused for every render. Qt setters copy these, so
 # sharing one instance across threads is safe.
 _TILE_QSIZE = QSize(TILE_SIZE, TILE_SIZE)
 _TRANSPARENT = QColor(0, 0, 0, 0)
 
 # Tuning. These bound memory and amortise per-item overhead; none of them
 # affect the bytes written.
-RUN_CHUNK_TILES = 64            # max tiles handed to a worker in one go
 WRITE_BATCH_TILES = 512         # flush a worker's pending rows at this count
 WRITE_BATCH_BYTES = 4 << 20     # ...or this many encoded bytes, whichever first
 WRITE_QUEUE_DEPTH = 8           # bounded writer back-pressure
@@ -264,15 +390,86 @@ def make_logger() -> logging.Logger:
 # --------------------------------------------------------------------------
 
 def compute_worker_count(max_cpu_percent: int) -> int:
-    """Render worker count from a CPU percentage.
+    """Render worker count from a CPU percentage, always leaving the GUI a core.
 
-    Rendering is CPU-bound inside C++ with the GIL released, so more threads
-    than cores only adds context-switching and cache pressure; the count is
-    capped at the core count by construction.
+    The percentage is applied to `cores - 1`, and the result can never exceed
+    `cores - 1`. This is a deliberate behaviour change from the previous
+    implementation, which returned `floor(cores * pct/100)` and therefore
+    handed out every core on the machine at 100%.
+
+    That was a primary cause of the "QGIS is not responding" freeze. Tile
+    rendering is CPU-bound C++ that holds the CPU continuously; if every core
+    is occupied by a render worker, the OS has nowhere to schedule the main
+    thread, so the GUI cannot repaint no matter how little work it has to do
+    and no matter how few signals it is sent. Reserving one core is what
+    makes the difference between "usable" and "frozen"; it costs at most
+    `1/cores` of throughput.
     """
     pct = max(1, min(100, int(max_cpu_percent)))
     cores = os.cpu_count() or 1
-    return max(1, math.floor(cores * (pct / 100.0)))
+    budget = max(1, cores - 1)
+    return max(1, min(budget, round(budget * (pct / 100.0))))
+
+
+def lower_current_thread_priority() -> None:
+    """Best-effort de-prioritisation of the calling thread at OS level.
+
+    `QThread.start(LowPriority)` is the portable request, but Qt documents
+    that thread priorities are **ignored on Linux** under the default
+    scheduler, so the portable path alone is not enough on the platform where
+    most heavy QGIS processing runs.
+
+    Lowering priority matters because the render workers spend nearly all
+    their time inside process-global QGIS/Qt locks - the `QFontDatabase`
+    mutex taken for every label layout, the `QgsCoordinateTransform` cache
+    lock taken per layer per tile, the SVG and image caches. The main thread
+    needs those same locks to draw so much as a menu label. When the workers
+    are de-prioritised, the scheduler preempts them in favour of the GUI
+    thread, so those locks are handed over promptly instead of being
+    reacquired immediately by whichever worker was already running.
+
+    Every step is best-effort: a failure here degrades responsiveness, never
+    correctness, so nothing is raised.
+    """
+    system = platform.system()
+    try:
+        if system == "Windows":
+            THREAD_PRIORITY_BELOW_NORMAL = -1
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.SetThreadPriority(
+                kernel32.GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL
+            )
+        elif system == "Linux":
+            # On Linux `setpriority(PRIO_PROCESS, tid, n)` is per-thread when
+            # given a kernel thread id, which is what makes this work at all;
+            # `os.nice()` would apply to the whole process, GUI thread
+            # included, and make matters worse.
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            SYS_GETTID = 186 if platform.machine() in ("x86_64", "AMD64") else 178
+            tid = libc.syscall(SYS_GETTID)
+            if tid > 0:
+                os.setpriority(os.PRIO_PROCESS, tid, 5)
+    except Exception:
+        pass
+
+
+def normalise_metatile_size(metatile_size_px: int) -> int:
+    """Clamp a requested metatile size to a whole number of tiles.
+
+    The block must be an exact integer multiple of TILE_SIZE, otherwise
+    slicing would not land on tile boundaries. Values are rounded DOWN to the
+    nearest multiple so a request never silently increases memory use, and
+    clamped to [MIN_METATILE_SIZE_PX, MAX_METATILE_SIZE_PX].
+
+    Passing TILE_SIZE yields a one-tile block, i.e. metatiling disabled.
+    """
+    try:
+        requested = int(metatile_size_px)
+    except (TypeError, ValueError):
+        requested = DEFAULT_METATILE_SIZE_PX
+    requested = max(MIN_METATILE_SIZE_PX, min(MAX_METATILE_SIZE_PX, requested))
+    tiles = max(1, requested // TILE_SIZE)
+    return tiles * TILE_SIZE
 
 
 def equatorial_scale_denominator(extent_width_degrees: float, paper_width_m: float) -> float:
@@ -448,7 +645,7 @@ class TileMatrixSet:
                 zoom,
                 crs,
                 TILE_MATRIX_TILE_ORIGIN,
-                TILE_MATRIX_Z0_DIMENSION_DEGREES,
+                TILE_MATRIX_Z0_TILE_SPAN,
                 TILE_MATRIX_ROOT_WIDTH,
                 TILE_MATRIX_ROOT_HEIGHT,
             )
@@ -561,6 +758,46 @@ class _RowIntervals:
         for row in list(out_rows):
             out_rows[row] = _merge_intervals(out_rows[row])
         return out
+
+    def iter_blocks(self, zoom: int, block: int) -> Iterator[Tuple]:
+        """Yield aligned metatile blocks that contain at least one occupied tile.
+
+        Each item is `(zoom, block_row, block_col, members, tile_count)` where
+        `members` is a tuple of `(row, col_start, col_end)` runs clipped to the
+        block. Only these runs are ever encoded and written, so metatiling
+        never adds tiles that the occupancy index excluded - the set of rows in
+        the GeoPackage is identical with and without metatiling.
+
+        Blocks with no occupied tile are not emitted at all, which is what
+        preserves the occupancy index's guarantee that runtime tracks real
+        content rather than extent size.
+        """
+        groups: Dict[int, List[Tuple[int, List[Tuple[int, int]]]]] = defaultdict(list)
+        for row, spans in self._rows.items():
+            groups[row // block].append((row, spans))
+
+        for block_row in sorted(groups):
+            members_by_row = groups[block_row]
+            block_cols: set = set()
+            for _row, spans in members_by_row:
+                for start, end in spans:
+                    block_cols.update(range(start // block, end // block + 1))
+
+            for block_col in sorted(block_cols):
+                low = block_col * block
+                high = low + block - 1
+                members: List[Tuple[int, int, int]] = []
+                count = 0
+                for row, spans in members_by_row:
+                    for start, end in spans:
+                        clipped_start = start if start > low else low
+                        clipped_end = end if end < high else high
+                        if clipped_start <= clipped_end:
+                            members.append((row, clipped_start, clipped_end))
+                            count += clipped_end - clipped_start + 1
+                if members:
+                    members.sort()
+                    yield (zoom, block_row, block_col, tuple(members), count)
 
     def iter_runs(self, zoom: int, max_run: int) -> Iterator[Tuple[int, int, int, int]]:
         """Yield `(zoom, row, col_start, col_end)` runs of at most `max_run`
@@ -859,12 +1096,15 @@ class OccupancyIndex:
             return False
         return processed
 
-    def iter_runs(self, max_run: int = RUN_CHUNK_TILES) -> Iterator[Tuple[int, int, int, int]]:
-        """Stream every scheduled tile as compact `(zoom, row, c0, c1)` runs,
-        coarsest zoom first. Nothing is materialised, so peak memory stays
-        proportional to queue depth rather than to job size."""
+    def iter_blocks(self, block_tiles: int) -> Iterator[Tuple]:
+        """Stream every scheduled metatile block, coarsest zoom first.
+
+        Nothing is materialised beyond one zoom level's interval map, which is
+        already resident, so peak memory stays proportional to queue depth
+        rather than to job size.
+        """
         for zoom in range(self._min_zoom, self._max_zoom + 1):
-            yield from self._levels[zoom - self._min_zoom].iter_runs(zoom, max_run)
+            yield from self._levels[zoom - self._min_zoom].iter_blocks(zoom, block_tiles)
 
     def tile_count(self, zoom: int) -> int:
         return self._levels[zoom - self._min_zoom].tile_count
@@ -1153,13 +1393,17 @@ class GeoPackageWriter:
 class _WorkerRenderState:
     """Per-thread render scratch space.
 
-    Everything here is allocated exactly once per worker thread and reused
-    for every tile it renders. The map settings are configured once at
-    thread start-up (layers, size, DPI, CRS, flags, labeling settings,
-    background), the expression context is refreshed only when the zoom
-    level changes, and only `setExtent()` is called per tile. The previous
-    implementation re-issued roughly a dozen sip calls per tile for values
-    that never varied.
+    Allocated once per worker and reused for every metatile it renders. The
+    map settings are configured once at thread start-up (layers, DPI, CRS,
+    flags, labeling settings, background); the expression context is
+    refreshed only when the zoom level changes, the output size only when the
+    block dimensions change, and only `setExtent()` varies per block.
+
+    `image` is the full-size metatile target, allocated once. Edge blocks -
+    the partial blocks at the right and bottom of a matrix - need a smaller
+    target, so they get a short-lived image instead of permanently caching
+    every distinct edge size. Edge blocks are a small minority, and this
+    keeps per-worker memory at a single predictable figure.
     """
 
     settings: QgsMapSettings
@@ -1170,6 +1414,12 @@ class _WorkerRenderState:
     scope: QgsExpressionContextScope
     layers: List[QgsMapLayer] = field(default_factory=list)
     zoom: int = -1
+    size: Tuple[int, int] = (0, 0)
+
+    def target(self, width: int, height: int) -> QImage:
+        if width == self.image.width() and height == self.image.height():
+            return self.image
+        return QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
 
 
 class TileRenderer:
@@ -1194,6 +1444,7 @@ class TileRenderer:
         min_zoom: int,
         max_zoom: int,
         logger: logging.Logger,
+        metatile_size_px: int = DEFAULT_METATILE_SIZE_PX,
     ):
         self._snapshot = snapshot
         self._dpi = dpi
@@ -1207,14 +1458,24 @@ class TileRenderer:
 
         self._clone_lock = threading.Lock()
 
-        # Output size and DPI are fixed for the whole export, so the paper
-        # width is invariant and the zoom-0 scale denominator is computed
-        # exactly once. Every deeper zoom is that baseline halved, because
-        # the matrix is a strict quadtree. Precomputing the whole table
-        # removes both the per-tile division and the unsynchronised shared
-        # cache dict the old code mutated from every worker thread.
+        self.block_tiles = normalise_metatile_size(metatile_size_px) // TILE_SIZE
+        self._block_px = self.block_tiles * TILE_SIZE
+
+        # DPI is fixed for the whole export, so the "paper" width of a single
+        # tile is invariant and the zoom-0 scale denominator is computed
+        # exactly once; every deeper zoom is that baseline halved, because the
+        # matrix is a strict quadtree.
+        #
+        # Metatiling does not enter this calculation at all, and that is the
+        # whole point: a block covers `block_tiles` times the ground width at
+        # `block_tiles` times the pixel width, so ground units per pixel - and
+        # therefore the scale denominator - is identical to a single tile at
+        # the same zoom. Symbology, label and layer-visibility thresholds
+        # evaluate exactly as they do without metatiling.
         paper_width_m = (TILE_SIZE / float(dpi)) * INCH_METERS
-        scale_zoom0 = equatorial_scale_denominator(ZOOM0_TILE_WIDTH_DEGREES, paper_width_m)
+        scale_zoom0 = SCALE_DENOMINATOR_FACTOR * equatorial_scale_denominator(
+            ZOOM0_TILE_SPAN_DEGREES, paper_width_m
+        )
         self._scales: Tuple[float, ...] = tuple(
             scale_zoom0 / (1 << zoom) for zoom in range(min_zoom, max_zoom + 1)
         )
@@ -1239,8 +1500,9 @@ class TileRenderer:
         # settings on its own; without this, tiles render with engine
         # defaults and labels are free to cross tile boundaries.
         settings.setLabelingEngineSettings(snapshot.labeling_settings)
-        settings.setOutputSize(_TILE_QSIZE)
         settings.setOutputDpi(self._dpi)
+        # Output size is set per block by render_block(), because edge blocks
+        # are smaller than a full metatile.
         for flag in (_MS_FLAG_ANTIALIASING, _MS_FLAG_RENDER_MAP_TILE, _MS_FLAG_ADVANCED_EFFECTS):
             if flag is not None:
                 settings.setFlag(flag, True)
@@ -1254,7 +1516,7 @@ class TileRenderer:
 
         return _WorkerRenderState(
             settings=settings,
-            image=QImage(TILE_SIZE, TILE_SIZE, QImage.Format.Format_ARGB32_Premultiplied),
+            image=QImage(self._block_px, self._block_px, QImage.Format.Format_ARGB32_Premultiplied),
             painter=QPainter(),
             buffer=buffer,
             context=context,
@@ -1296,33 +1558,97 @@ class TileRenderer:
                     overrides[clone.id()] = style
         return clones, overrides
 
-    # -- per-tile ---------------------------------------------------------
+    # -- per-block --------------------------------------------------------
 
-    def render(self, state: _WorkerRenderState, zoom: int, extent: QgsRectangle) -> bytes:
+    def block_extent(
+        self,
+        tile_matrix_set: "TileMatrixSet",
+        zoom: int,
+        col_start: int,
+        col_end: int,
+        row_start: int,
+        row_end: int,
+    ) -> QgsRectangle:
+        """Ground extent of a tile block, derived only from QgsTileMatrix.
+
+        Built as the union of the block's north-west and south-east corner
+        tiles rather than from independent zoom/row/col arithmetic, so
+        QgsTileMatrix remains the single source of truth for every bound and
+        the block edges coincide exactly with the tile edges inside it.
+
+        Only tiles that actually exist in the matrix are referenced, so this
+        never relies on extrapolating past the matrix edge.
+        """
+        extent = QgsRectangle(tile_matrix_set.tile_extent(zoom, col_start, row_start))
+        extent.combineExtentWith(tile_matrix_set.tile_extent(zoom, col_end, row_end))
+        return extent
+
+    def render_block(
+        self,
+        state: _WorkerRenderState,
+        tile_matrix_set: "TileMatrixSet",
+        zoom: int,
+        col_start: int,
+        col_end: int,
+        row_start: int,
+        row_end: int,
+    ) -> QImage:
+        """Render a whole tile block in one job and return the target image.
+
+        Rows increase southward from the matrix origin and QImage y increases
+        downward, so a tile at (col, row) occupies
+        `((col - col_start) * TILE_SIZE, (row - row_start) * TILE_SIZE)` in the
+        returned image, with no coordinate flip.
+        """
+        cols = col_end - col_start + 1
+        rows = row_end - row_start + 1
+        width = cols * TILE_SIZE
+        height = rows * TILE_SIZE
+
         settings = state.settings
 
-        # The scale denominator is a function of zoom only (every tile in a
-        # zoom level is the same width), and work is dispatched zoom-major,
-        # so this fires once per zoom per thread rather than once per tile.
-        # QgsMapSettings copies the context, so it must be re-set whenever
-        # the scope changes.
+        # The scale denominator is a function of zoom only, and work is
+        # dispatched zoom-major, so this fires once per zoom per thread.
+        # QgsMapSettings copies the context, so it must be re-set whenever the
+        # scope changes.
         if state.zoom != zoom:
             state.scope.setVariable("map_scale", self._scales[zoom - self._min_zoom], True)
             settings.setExpressionContext(state.context)
             state.zoom = zoom
 
-        settings.setExtent(extent)
+        # Only changes for edge blocks, so this is effectively a no-op on the
+        # hot path.
+        if state.size != (width, height):
+            settings.setOutputSize(QSize(width, height))
+            state.size = (width, height)
 
-        image = state.image
+        # The extent's aspect ratio equals the output size's aspect ratio
+        # exactly (square tiles, integer block dimensions), so QgsMapSettings
+        # performs no aspect adjustment and each tile lands on an exact
+        # 256-pixel boundary.
+        settings.setExtent(
+            self.block_extent(tile_matrix_set, zoom, col_start, col_end, row_start, row_end)
+        )
+
+        image = state.target(width, height)
         painter = state.painter
-        image.fill(0)  # transparent for ARGB32_Premultiplied; identical to QColor(0,0,0,0)
+        image.fill(0)  # transparent for ARGB32_Premultiplied
         painter.begin(image)
         try:
             QgsMapRendererCustomPainterJob(settings, painter).renderSynchronously()
         finally:
             painter.end()
+        return image
 
-        return self._encode(state, image)
+    def encode_tile(self, state: _WorkerRenderState, block_image: QImage, x: int, y: int) -> bytes:
+        """Slice one tile out of a rendered block and encode it.
+
+        `QImage.copy()` produces a standalone image in the same
+        ARGB32_Premultiplied format the per-tile path used, so the encoder
+        input - and therefore the encoded bytes for identical pixels - is
+        unchanged.
+        """
+        return self._encode(state, block_image.copy(x, y, TILE_SIZE, TILE_SIZE))
 
     def _encode(self, state: _WorkerRenderState, image: QImage) -> bytes:
         if not self._is_native:
@@ -1395,6 +1721,29 @@ def _encode_via_gdal(image: QImage, driver_name: str, quality: int) -> bytes:
 # Exporter
 # --------------------------------------------------------------------------
 
+class _RenderWorker(QThread):
+    """A render worker as a QThread so it can be started at low priority.
+
+    `threading.Thread` gives no way to express scheduling priority, and
+    priority is the difference between a responsive GUI and a frozen one here:
+    the workers hold process-global QGIS/Qt locks (font database, coordinate
+    transform cache, SVG cache) for nearly their entire runtime, and the main
+    thread needs those same locks to draw anything at all.
+
+    `run()` delegates straight back to the exporter's loop, so the rendering
+    logic itself is unchanged and untangled from the threading mechanism.
+    """
+
+    def __init__(self, index: int, loop: Callable[..., None], args: tuple):
+        super().__init__()
+        self._loop = loop
+        self._args = args
+        self.setObjectName(f"xyz-render-{index}")
+
+    def run(self) -> None:  # noqa: D102 - QThread entry point
+        self._loop(*self._args)
+
+
 @dataclass
 class _WorkerStats:
     """Counters owned exclusively by one worker thread.
@@ -1436,6 +1785,7 @@ class XyzGpkgExporter:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
         occupancy_tile_buffer: int = 1,
+        metatile_size_px: int = DEFAULT_METATILE_SIZE_PX,
         status_callback: Optional[Callable[[str], None]] = None,
         snapshot: Optional[ProjectRenderSnapshot] = None,
     ):
@@ -1451,6 +1801,7 @@ class XyzGpkgExporter:
         self.tile_format = tile_format.upper()
         self.quality = max(0, min(100, int(quality)))
         self.occupancy_tile_buffer = max(0, int(occupancy_tile_buffer))
+        self.metatile_size_px = normalise_metatile_size(metatile_size_px)
 
         self.progress_callback = progress_callback
         self.status_callback = status_callback
@@ -1473,14 +1824,19 @@ class XyzGpkgExporter:
         self.tiles_failed = 0
         self.cancelled = False
 
+        block_tiles = self.metatile_size_px // TILE_SIZE
         self._logger.info(
-            "Export configured: %d layer(s), zoom %d-%d, %s @ %d dpi, theme=%s",
+            "Export configured: %d layer(s), zoom %d-%d, %s @ %d dpi, theme=%s, "
+            "metatile %dpx (%dx%d tiles per render job)",
             len(self.snapshot.layers),
             self.min_zoom,
             self.max_zoom,
             self.tile_format,
             self.dpi,
             self.snapshot.theme_name or "<none>",
+            self.metatile_size_px,
+            block_tiles,
+            block_tiles,
         )
 
     # -- small helpers ----------------------------------------------------
@@ -1544,7 +1900,12 @@ class XyzGpkgExporter:
 
         worker_count = compute_worker_count(self.max_cpu_percent)
         self._logger.info(
-            "Rendering %s tile(s) with %d worker thread(s)", f"{total_tiles:,}", worker_count
+            "Rendering %s tile(s) with %d worker thread(s), %dpx metatiles (~%.1f MB "
+            "render target per worker)",
+            f"{total_tiles:,}",
+            worker_count,
+            self.metatile_size_px,
+            (self.metatile_size_px ** 2 * 4) / (1024 * 1024),
         )
         self._status(f"Rendering {total_tiles:,} tiles...")
 
@@ -1565,6 +1926,7 @@ class XyzGpkgExporter:
             min_zoom=self.min_zoom,
             max_zoom=self.max_zoom,
             logger=self._logger,
+            metatile_size_px=self.metatile_size_px,
         )
 
         stop = threading.Event()
@@ -1575,20 +1937,22 @@ class XyzGpkgExporter:
         errors: "queue.Queue[str]" = queue.Queue()
 
         writer.start()
+        # QThread rather than threading.Thread specifically so the workers can
+        # be started at LowPriority. See lower_current_thread_priority() for
+        # why priority is the lever that actually frees the GUI thread.
         workers = [
-            threading.Thread(
-                target=self._worker_loop,
+            _RenderWorker(
+                index=index,
+                loop=self._worker_loop,
                 args=(index, renderer, writer, tile_matrix_set, work_queue, stats[index], stop, errors),
-                name=f"xyz-render-{index}",
-                daemon=True,
             )
             for index in range(worker_count)
         ]
         for worker in workers:
-            worker.start()
+            worker.start(QThread.Priority.LowPriority)
 
         try:
-            self._dispatch(occupancy, work_queue, stop, stats, total_tiles, worker_count)
+            self._dispatch(occupancy, work_queue, stop, stats, total_tiles, renderer.block_tiles)
         finally:
             # Unblock every worker whatever happened, then wait them out
             # while continuing to tick progress and cancellation.
@@ -1597,6 +1961,8 @@ class XyzGpkgExporter:
             self._join_with_ticks(workers, stats, total_tiles)
 
             self.cancelled = stop.is_set()
+            if not self.cancelled:
+                self._status("Finalising GeoPackage (building tile index)...")
             try:
                 row_count = writer.close(build_index=not self.cancelled)
             except Exception as exc:
@@ -1635,8 +2001,8 @@ class XyzGpkgExporter:
 
     # -- controller -------------------------------------------------------
 
-    def _dispatch(self, occupancy, work_queue, stop, stats, total_tiles, worker_count) -> None:
-        """Feed tile runs into the pipeline, ticking progress and
+    def _dispatch(self, occupancy, work_queue, stop, stats, total_tiles, block_tiles) -> None:
+        """Feed metatile blocks into the pipeline, ticking progress and
         cancellation on a wall clock.
 
         `Queue.put()` with a timeout is a genuine blocking wait, not a spin:
@@ -1648,10 +2014,10 @@ class XyzGpkgExporter:
         last_tick = 0.0
         put = work_queue.put
 
-        for run in occupancy.iter_runs(RUN_CHUNK_TILES):
+        for block in occupancy.iter_blocks(block_tiles):
             while True:
                 try:
-                    put(run, timeout=PROGRESS_INTERVAL_S)
+                    put(block, timeout=PROGRESS_INTERVAL_S)
                     break
                 except queue.Full:
                     last_tick = self._tick(stats, total_tiles, last_tick, stop)
@@ -1676,6 +2042,11 @@ class XyzGpkgExporter:
         for entry in stats:
             done += entry.written + entry.skipped + entry.failed
         self._report(done, total_tiles)
+        # The deepest zoom usually holds the overwhelming majority of tiles,
+        # so an honest percentage sits below 0.5% - and renders as "0%" - for a
+        # long time. Surfacing absolute counts makes real progress
+        # distinguishable from a hang.
+        self._status(f"Rendered {done:,} of {total_tiles:,} tiles")
         if not stop.is_set() and self._cancelled():
             self._logger.info("Cancellation requested - draining the render pipeline.")
             stop.set()
@@ -1690,10 +2061,10 @@ class XyzGpkgExporter:
         real timed wait on the thread's completion condition.
         """
         remaining = list(workers)
+        timeout_ms = int(PROGRESS_INTERVAL_S * 1000)
         while remaining:
             for worker in tuple(remaining):
-                worker.join(timeout=PROGRESS_INTERVAL_S)
-                if not worker.is_alive():
+                if worker.wait(timeout_ms):
                     remaining.remove(worker)
             self._report(sum(s.written + s.skipped + s.failed for s in stats), total_tiles)
 
@@ -1743,6 +2114,10 @@ class XyzGpkgExporter:
         for every ~5 ms of work and re-installed waiters across all
         outstanding futures on every `wait(FIRST_COMPLETED)` call.
         """
+        # Portable QThread priority is a request that Linux ignores; this is
+        # the per-thread OS-level fallback that actually takes effect there.
+        lower_current_thread_priority()
+
         try:
             state = renderer.create_state()
         except Exception as exc:
@@ -1753,8 +2128,8 @@ class XyzGpkgExporter:
                 pass
             return
 
-        tile_extent = tile_matrix_set.tile_extent
-        render = renderer.render
+        render_block = renderer.render_block
+        encode_tile = renderer.encode_tile
         get = work_queue.get
         pending: list = []
         pending_bytes = 0
@@ -1762,29 +2137,62 @@ class XyzGpkgExporter:
 
         try:
             while True:
-                run = get()
-                if run is None:
+                block = get()
+                if block is None:
                     return
                 if stop.is_set():
                     continue  # keep draining; the controller sends sentinels
 
-                zoom, row, col_start, col_end = run
-                for col in range(col_start, col_end + 1):
+                zoom, block_row, block_col, members, _count = block
+
+                # Bounds of the occupied part of this block. Rendering only as
+                # far as real content extends means a block whose occupied
+                # tiles sit in one corner does not rasterise the whole
+                # metatile - the occupancy index still governs how much work
+                # happens, exactly as it does without metatiling.
+                row_start = members[0][0]
+                row_end = members[-1][0]
+                col_start = min(run[1] for run in members)
+                col_end = max(run[2] for run in members)
+
+                try:
+                    block_image = render_block(
+                        state, tile_matrix_set, zoom, col_start, col_end, row_start, row_end
+                    )
+                except Exception as exc:
+                    # A whole block failed: count every tile it owned as
+                    # failed rather than silently dropping them.
+                    failed = sum(run[2] - run[1] + 1 for run in members)
+                    stats.failed += failed
+                    if error_budget > 0:
+                        error_budget -= 1
+                        errors.put(
+                            f"Metatile z={zoom} block=({block_row},{block_col}) "
+                            f"cols {col_start}-{col_end} rows {row_start}-{row_end} "
+                            f"failed, losing {failed} tile(s): {exc}"
+                        )
+                    continue
+
+                for row, run_start, run_end in members:
                     if stop.is_set():
                         break
-                    try:
-                        data = render(state, zoom, tile_extent(zoom, col, row))
-                        if not data:
-                            stats.skipped += 1
-                            continue
-                        pending.append((zoom, col, row, data))
-                        pending_bytes += len(data)
-                        stats.written += 1
-                    except Exception as exc:
-                        stats.failed += 1
-                        if error_budget > 0:
-                            error_budget -= 1
-                            errors.put(f"Tile z={zoom} x={col} y={row} failed: {exc}")
+                    y = (row - row_start) * TILE_SIZE
+                    for col in range(run_start, run_end + 1):
+                        try:
+                            data = encode_tile(
+                                state, block_image, (col - col_start) * TILE_SIZE, y
+                            )
+                            if not data:
+                                stats.skipped += 1
+                                continue
+                            pending.append((zoom, col, row, data))
+                            pending_bytes += len(data)
+                            stats.written += 1
+                        except Exception as exc:
+                            stats.failed += 1
+                            if error_budget > 0:
+                                error_budget -= 1
+                                errors.put(f"Tile z={zoom} x={col} y={row} failed: {exc}")
 
                 if pending_bytes >= WRITE_BATCH_BYTES or len(pending) >= WRITE_BATCH_TILES:
                     writer.submit(pending, stop)

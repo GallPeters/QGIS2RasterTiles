@@ -81,17 +81,27 @@ from qgis.core import (
 
 try:
     from .xyz_gpkg_exporter import (
+        DEFAULT_METATILE_SIZE_PX,
         LOG_TAG,
+        MAX_METATILE_SIZE_PX,
+        MIN_METATILE_SIZE_PX,
+        TILE_SIZE,
         ProjectRenderSnapshot,
         XyzGpkgExporter,
         compute_worker_count,
+        normalise_metatile_size,
     )
 except ImportError:  # running as a loose script / from the console
     from xyz_gpkg_exporter import (  # type: ignore[no-redef]
+        DEFAULT_METATILE_SIZE_PX,
         LOG_TAG,
+        MAX_METATILE_SIZE_PX,
+        MIN_METATILE_SIZE_PX,
+        TILE_SIZE,
         ProjectRenderSnapshot,
         XyzGpkgExporter,
         compute_worker_count,
+        normalise_metatile_size,
     )
 
 
@@ -100,6 +110,7 @@ TILE_FORMATS = ("PNG", "JPEG", "WEBP", "JPEG2000")
 # Feedback bridge limits. These exist purely to keep the dialog's log widget
 # from being flooded with queued cross-thread appends.
 FEEDBACK_MIN_INTERVAL_S = 0.25
+FEEDBACK_STATUS_INTERVAL_S = 1.0
 FEEDBACK_MAX_ERRORS = 25
 FEEDBACK_MAX_WARNINGS = 25
 
@@ -217,6 +228,7 @@ class _FeedbackBridge:
         self._handler = _FeedbackLogHandler(feedback)
         self._handler.setFormatter(logging.Formatter("%(message)s"))
         self._last_progress = 0.0
+        self._last_status_at = 0.0
         self._last_status: Optional[str] = None
 
     def __enter__(self) -> "_FeedbackBridge":
@@ -243,8 +255,18 @@ class _FeedbackBridge:
         self._feedback.setProgress(min(100.0, 100.0 * done / total))
 
     def on_status(self, message: str) -> None:
+        """Update the dialog's status line.
+
+        Throttled harder than progress: the exporter now ticks status with
+        absolute tile counts, and `setProgressText` is another queued
+        cross-thread emission, so it is limited to roughly once a second.
+        """
         if message == self._last_status:
             return
+        now = time.monotonic()
+        if now - self._last_status_at < FEEDBACK_STATUS_INTERVAL_S:
+            return
+        self._last_status_at = now
         self._last_status = message
         try:
             self._feedback.setProgressText(message)
@@ -267,6 +289,7 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
     TILE_FORMAT = "TILE_FORMAT"
     QUALITY = "QUALITY"
     OCCUPANCY_TILE_BUFFER = "OCCUPANCY_TILE_BUFFER"
+    METATILE_SIZE = "METATILE_SIZE"
     OUTPUT_DIR = "OUTPUT_DIR"
     OUTPUT_FILE = "OUTPUT_FILE"
 
@@ -309,9 +332,13 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
             "box, so a sparse dataset spread over a large extent skips empty tiles instead of "
             "spending time rendering them. See the 'Occupancy padding' parameter if tiles near "
             "real content come out unexpectedly empty.\n\n"
-            "The export runs on background threads and reports progress on a fixed interval, so "
-            "QGIS stays responsive and Cancel takes effect promptly even on multi-million-tile "
-            "jobs."
+            "Tiles are rendered in metatile blocks (2048 px by default) and sliced apart, which "
+            "is both substantially faster and much closer to what the project looks like on "
+            "screen, because the label engine gets a screen-sized viewport instead of a single "
+            "256 px tile. See the 'Metatile size' parameter.\n\n"
+            "The export runs on low-priority background threads, always leaving one CPU core "
+            "for the interface, and reports progress on a fixed interval, so QGIS stays "
+            "responsive and Cancel takes effect promptly even on multi-million-tile jobs."
         )
 
     def flags(self):
@@ -346,8 +373,12 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
             self.CPU_PERCENT, "Max CPU usage (%)", default=75, minimum=1, maximum=100,
             help_text=(
                 "Render worker threads are allocated as this percentage of the available CPU "
-                "cores. Rendering is CPU bound, so values above 100% of the core count would "
-                "only add contention and are not offered."
+                "cores MINUS ONE. One core is always reserved so the QGIS interface has "
+                "somewhere to be scheduled; without that reservation the GUI cannot repaint at "
+                "all while an export is running, however little work it has to do.\n\n"
+                "Workers also run at reduced OS priority. If the interface is still sluggish "
+                "during an export, lower this value - it trades throughput for responsiveness "
+                "roughly linearly."
             ),
         ))
         add(QgsProcessingParameterEnum(
@@ -367,6 +398,29 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
                 "placement - extending beyond the bare geometry. The default of 1 covers typical "
                 "symbology; raise it if the project uses unusually large point markers or label "
                 "offsets and tiles near real content come out unexpectedly empty."
+            ),
+        ))
+        add(self._int_param(
+            self.METATILE_SIZE, "Metatile size (pixels)",
+            default=DEFAULT_METATILE_SIZE_PX,
+            minimum=MIN_METATILE_SIZE_PX, maximum=MAX_METATILE_SIZE_PX,
+            help_text=(
+                "Tiles are rendered in square blocks of this pixel size in a single render "
+                "pass, then sliced into individual 256 px tiles.\n\n"
+                "Larger blocks are faster and keep the interface freer: one renderer setup, "
+                "one label pass and one coordinate-transform pass per block instead of per "
+                "tile, and each feature is drawn once per block rather than once per tile it "
+                "crosses.\n\n"
+                "Larger blocks also look closer to the project on screen. Labels are only "
+                "placed if they fit inside the render viewport, so a lone 256 px tile - about "
+                "68 mm at 96 dpi - drops nearly every label. A 2048 px block gives the label "
+                "engine a screen-sized viewport, and labels stop disappearing at tile seams.\n\n"
+                "Map scale is NOT affected: a block covers proportionally more ground at "
+                "proportionally more pixels, so symbol sizes and all scale-dependent rules "
+                "render exactly as they would tile by tile.\n\n"
+                "Cost is memory: each render thread holds one block image, which is about "
+                "4 MB at 1024 px, 17 MB at 2048 px and 67 MB at 4096 px. Values are rounded "
+                "down to a whole number of tiles. Set this to 256 to disable metatiling."
             ),
         ))
         add(QgsProcessingParameterFolderDestination(
@@ -408,6 +462,9 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
         cpu_percent = self.parameterAsInt(parameters, self.CPU_PERCENT, context)
         quality = self.parameterAsInt(parameters, self.QUALITY, context)
         tile_buffer = self.parameterAsInt(parameters, self.OCCUPANCY_TILE_BUFFER, context)
+        metatile_size = normalise_metatile_size(
+            self.parameterAsInt(parameters, self.METATILE_SIZE, context)
+        )
         tile_format = TILE_FORMATS[self.parameterAsEnum(parameters, self.TILE_FORMAT, context)]
 
         output_dir = self.parameterAsString(parameters, self.OUTPUT_DIR, context)
@@ -446,6 +503,7 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
                 quality=quality,
                 output_dir=output_dir,
                 occupancy_tile_buffer=tile_buffer,
+                metatile_size_px=metatile_size,
                 snapshot=snapshot,
                 should_cancel=feedback.isCanceled,
             )
@@ -454,11 +512,19 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
                 self.tr(f"Could not configure the export: {exc}")
             ) from exc
 
+        block_tiles = metatile_size // TILE_SIZE
+        workers = compute_worker_count(cpu_percent)
         feedback.pushInfo(self.tr(
             f"Export configured: zoom {min_zoom}-{max_zoom}, {tile_format} @ {dpi} dpi, "
-            f"{len(snapshot.layers)} layer(s), "
-            f"{compute_worker_count(cpu_percent)} render thread(s)."
+            f"{len(snapshot.layers)} layer(s), {workers} render thread(s), "
+            f"{metatile_size}px metatiles ({block_tiles}x{block_tiles} tiles per render pass, "
+            f"~{metatile_size ** 2 * 4 / (1024 * 1024):.0f} MB per thread)."
         ))
+        if block_tiles == 1:
+            feedback.pushInfo(self.tr(
+                "Metatiling is disabled at this size. Labels that do not fit inside a single "
+                "256 px tile will be dropped."
+            ))
         return True
 
     # -- lifecycle: worker thread -----------------------------------------
