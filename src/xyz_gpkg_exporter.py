@@ -374,7 +374,30 @@ class _QgsMessageLogHandler(logging.Handler):
             pass
 
 
+def format_duration(seconds: float) -> str:
+    """Human-readable elapsed time for the one end-of-run message."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+
+
 def make_logger() -> logging.Logger:
+    """Logger for this module.
+
+    Only a handful of plain-language records are emitted at INFO, so the QGIS
+    Log Messages panel and the Processing dialog stay readable: start, finish,
+    and anything that actually went wrong. Every diagnostic - tile matrix
+    dimensions, per-zoom occupancy counts, worker and metatile plans, writer
+    row counts, individual tile failures - is at DEBUG and therefore dropped.
+
+    To get the full diagnostics back for troubleshooting:
+
+        import logging
+        logging.getLogger("XyzGpkgExporter").setLevel(logging.DEBUG)
+    """
     logger = logging.getLogger(LOG_TAG)
     if not any(isinstance(h, _QgsMessageLogHandler) for h in logger.handlers):
         handler = _QgsMessageLogHandler()
@@ -856,14 +879,12 @@ class OccupancyIndex:
         logger: logging.Logger,
         tile_buffer: int = 1,
         should_cancel: Optional[Callable[[], bool]] = None,
-        status_callback: Optional[Callable[[str], None]] = None,
     ):
         self._min_zoom = min_zoom
         self._max_zoom = max_zoom
         self.cancelled = False
 
         should_cancel = should_cancel or (lambda: False)
-        status = status_callback or (lambda _msg: None)
 
         project = snapshot.project
         dest_crs = snapshot.dest_crs
@@ -899,13 +920,13 @@ class OccupancyIndex:
             try:
                 if layer is None or not layer.isValid():
                     logger.warning(
-                        "Occupancy: layer '%s' is invalid, skipping",
+                        "Skipping layer '%s' - it could not be read.",
                         layer.name() if layer is not None else "?",
                     )
                     continue
                 layer_extent = layer.extent()
                 if layer_extent is None or layer_extent.isEmpty():
-                    logger.warning("Occupancy: layer '%s' has an empty extent, skipping", layer.name())
+                    logger.warning("Skipping layer '%s' - it contains no data.", layer.name())
                     continue
 
                 src_crs = layer.crs()
@@ -919,7 +940,6 @@ class OccupancyIndex:
                 )
 
                 if isinstance(layer, QgsVectorLayer) and layer.isSpatial():
-                    status(f"Scanning features: {layer.name()}")
                     scanned = self._mark_features(
                         layer=layer,
                         to_dest=to_dest,
@@ -940,11 +960,10 @@ class OccupancyIndex:
                 usable_layers += 1
             except Exception as exc:
                 logger.warning(
-                    "Occupancy: skipping layer '%s' after an error: %s",
+                    "Skipping layer '%s' - it could not be read.",
                     layer.name() if layer is not None else "?",
-                    exc,
                 )
-                logger.debug("%s", traceback.format_exc())
+                logger.debug("Layer read error: %s\n%s", exc, traceback.format_exc())
 
         if should_cancel():
             self.cancelled = True
@@ -965,7 +984,7 @@ class OccupancyIndex:
         self._levels = levels
         self.total_tile_count = sum(level.tile_count for level in levels)
 
-        logger.info(
+        logger.debug(
             "Occupancy: %s tile(s) scheduled across zooms %d-%d (%s)",
             f"{self.total_tile_count:,}",
             min_zoom,
@@ -987,9 +1006,8 @@ class OccupancyIndex:
         if not occupied.is_empty():
             return
 
-        logger.warning(
-            "Occupancy: no vector layer contributed any tile - falling back to %d area-layer "
-            "extent(s) as a last resort",
+        logger.debug(
+            "No vector layer contributed a tile; falling back to %d area-layer extent(s).",
             len(area_extents),
         )
         for extent_dest in area_extents:
@@ -1092,7 +1110,8 @@ class OccupancyIndex:
                 if clipped is not None:
                     add_block(*clipped)
         except Exception as exc:
-            logger.warning("Occupancy: feature scan failed for layer '%s': %s", layer.name(), exc)
+            logger.warning("Skipping layer '%s' - its features could not be read.", layer.name())
+            logger.debug("Feature scan error: %s", exc)
             return False
         return processed
 
@@ -1360,7 +1379,7 @@ class GeoPackageWriter:
             row_count = conn.execute(f"SELECT COUNT(*) FROM {self._table}").fetchone()[0]
         finally:
             conn.close()
-        self._logger.info("GeoPackage finalised: %s tile row(s) in '%s'", f"{row_count:,}", self._table)
+        self._logger.debug("GeoPackage finalised: %s tile row(s) in '%s'", f"{row_count:,}", self._table)
         return row_count
 
     def _create_unique_index(self) -> None:
@@ -1373,9 +1392,7 @@ class GeoPackageWriter:
         except sqlite3.IntegrityError:
             # Cannot happen with an intact occupancy index, but a corrupt or
             # externally modified file should degrade rather than abort.
-            self._logger.warning(
-                "Duplicate tile coordinates found; de-duplicating before indexing."
-            )
+            self._logger.debug("Duplicate tile coordinates found; de-duplicating before indexing.")
             self._conn.execute("BEGIN")
             self._conn.execute(
                 f"DELETE FROM {self._table} WHERE id NOT IN "
@@ -1546,7 +1563,7 @@ class TileRenderer:
                     if clone is None or not clone.isValid():
                         raise RuntimeError("clone() returned an invalid layer")
                 except Exception as exc:
-                    self._logger.warning(
+                    self._logger.debug(
                         "Could not clone layer '%s' for a render thread, sharing the original (%s)",
                         layer.name(),
                         exc,
@@ -1786,7 +1803,6 @@ class XyzGpkgExporter:
         should_cancel: Optional[Callable[[], bool]] = None,
         occupancy_tile_buffer: int = 1,
         metatile_size_px: int = DEFAULT_METATILE_SIZE_PX,
-        status_callback: Optional[Callable[[str], None]] = None,
         snapshot: Optional[ProjectRenderSnapshot] = None,
     ):
         if min_zoom < 0 or max_zoom < min_zoom:
@@ -1803,8 +1819,11 @@ class XyzGpkgExporter:
         self.occupancy_tile_buffer = max(0, int(occupancy_tile_buffer))
         self.metatile_size_px = normalise_metatile_size(metatile_size_px)
 
+        # Progress is reported ONLY as a numeric fraction, which the caller
+        # renders in its progress bar. There is deliberately no status-text
+        # callback: the percentage is already visible on the bar, and any text
+        # channel that repeats it ends up duplicated into the host's log panel.
         self.progress_callback = progress_callback
-        self.status_callback = status_callback
         self.should_cancel = should_cancel
 
         # Main-thread work. Doing this in the constructor is deliberate: it
@@ -1825,7 +1844,7 @@ class XyzGpkgExporter:
         self.cancelled = False
 
         block_tiles = self.metatile_size_px // TILE_SIZE
-        self._logger.info(
+        self._logger.debug(
             "Export configured: %d layer(s), zoom %d-%d, %s @ %d dpi, theme=%s, "
             "metatile %dpx (%dx%d tiles per render job)",
             len(self.snapshot.layers),
@@ -1843,13 +1862,6 @@ class XyzGpkgExporter:
 
     def _cancelled(self) -> bool:
         return bool(self.should_cancel and self.should_cancel())
-
-    def _status(self, message: str) -> None:
-        if self.status_callback:
-            try:
-                self.status_callback(message)
-            except Exception:
-                pass
 
     def _report(self, done: int, total: int) -> None:
         if self.progress_callback:
@@ -1870,12 +1882,9 @@ class XyzGpkgExporter:
         the pipeline is saturated.
         """
         started = time.monotonic()
-        self._logger.info("Starting export to %s", self.output_path)
-
-        self._status("Building tile matrices...")
+        self._logger.info("Analysing project data...")
         tile_matrix_set = TileMatrixSet(self.dest_crs, self.min_zoom, self.max_zoom)
 
-        self._status("Analysing layer content...")
         occupancy = OccupancyIndex(
             snapshot=self.snapshot,
             tile_matrix_set=tile_matrix_set,
@@ -1884,11 +1893,10 @@ class XyzGpkgExporter:
             logger=self._logger,
             tile_buffer=self.occupancy_tile_buffer,
             should_cancel=self.should_cancel,
-            status_callback=self._status,
         )
         if occupancy.cancelled or self._cancelled():
             self.cancelled = True
-            self._logger.info("Export cancelled during content analysis.")
+            self._logger.info("Cancelled.")
             return None
 
         total_tiles = occupancy.total_tile_count
@@ -1899,7 +1907,7 @@ class XyzGpkgExporter:
             )
 
         worker_count = compute_worker_count(self.max_cpu_percent)
-        self._logger.info(
+        self._logger.debug(
             "Rendering %s tile(s) with %d worker thread(s), %dpx metatiles (~%.1f MB "
             "render target per worker)",
             f"{total_tiles:,}",
@@ -1907,7 +1915,7 @@ class XyzGpkgExporter:
             self.metatile_size_px,
             (self.metatile_size_px ** 2 * 4) / (1024 * 1024),
         )
-        self._status(f"Rendering {total_tiles:,} tiles...")
+        self._logger.info("Generating tiles...")
 
         writer = GeoPackageWriter(
             path=self.output_path,
@@ -1961,8 +1969,6 @@ class XyzGpkgExporter:
             self._join_with_ticks(workers, stats, total_tiles)
 
             self.cancelled = stop.is_set()
-            if not self.cancelled:
-                self._status("Finalising GeoPackage (building tile index)...")
             try:
                 row_count = writer.close(build_index=not self.cancelled)
             except Exception as exc:
@@ -1975,17 +1981,23 @@ class XyzGpkgExporter:
         self._drain_errors(errors)
 
         elapsed = time.monotonic() - started
-        rate = self.tiles_written / elapsed if elapsed > 0 else 0.0
-        self._logger.info(
-            "Export %s in %.1fs: %s written, %s skipped, %s failed (%.0f tiles/s) -> %s",
-            "cancelled" if self.cancelled else "complete",
+        self._logger.debug(
+            "%s in %.1fs: %s written, %s skipped, %s failed (%.0f tiles/s)",
+            "Cancelled" if self.cancelled else "Complete",
             elapsed,
             f"{self.tiles_written:,}",
             f"{self.tiles_skipped:,}",
             f"{self.tiles_failed:,}",
-            rate,
-            self.output_path,
+            self.tiles_written / elapsed if elapsed > 0 else 0.0,
         )
+        if self.cancelled:
+            self._logger.info("Cancelled after %s.", format_duration(elapsed))
+        else:
+            self._logger.info(
+                "Finished in %s. GeoPackage saved to: %s",
+                format_duration(elapsed),
+                self.output_path,
+            )
 
         if self.cancelled:
             return self.output_path if row_count else None
@@ -2042,13 +2054,8 @@ class XyzGpkgExporter:
         for entry in stats:
             done += entry.written + entry.skipped + entry.failed
         self._report(done, total_tiles)
-        # The deepest zoom usually holds the overwhelming majority of tiles,
-        # so an honest percentage sits below 0.5% - and renders as "0%" - for a
-        # long time. Surfacing absolute counts makes real progress
-        # distinguishable from a hang.
-        self._status(f"Rendered {done:,} of {total_tiles:,} tiles")
         if not stop.is_set() and self._cancelled():
-            self._logger.info("Cancellation requested - draining the render pipeline.")
+            self._logger.debug("Cancellation requested - draining the render pipeline.")
             stop.set()
         return now if now is not None else time.monotonic()
 
@@ -2079,19 +2086,17 @@ class XyzGpkgExporter:
                     return
 
     def _drain_errors(self, errors: "queue.Queue[str]") -> None:
-        reported = 0
+        # Individual failures go to DEBUG so the visible log stays readable;
+        # the user gets one plain sentence telling them something was lost.
         while True:
             try:
-                message = errors.get_nowait()
+                self._logger.debug("%s", errors.get_nowait())
             except queue.Empty:
                 break
-            if reported < MAX_REPORTED_TILE_ERRORS:
-                self._logger.error("%s", message)
-                reported += 1
-        if self.tiles_failed > reported:
-            self._logger.error(
-                "%s further tile failure(s) were suppressed to avoid flooding the log.",
-                f"{self.tiles_failed - reported:,}",
+        if self.tiles_failed:
+            self._logger.warning(
+                "%s tile(s) could not be rendered and are missing from the output.",
+                f"{self.tiles_failed:,}",
             )
 
     # -- worker -----------------------------------------------------------

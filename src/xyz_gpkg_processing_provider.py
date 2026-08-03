@@ -85,10 +85,8 @@ try:
         LOG_TAG,
         MAX_METATILE_SIZE_PX,
         MIN_METATILE_SIZE_PX,
-        TILE_SIZE,
         ProjectRenderSnapshot,
         XyzGpkgExporter,
-        compute_worker_count,
         normalise_metatile_size,
     )
 except ImportError:  # running as a loose script / from the console
@@ -97,10 +95,8 @@ except ImportError:  # running as a loose script / from the console
         LOG_TAG,
         MAX_METATILE_SIZE_PX,
         MIN_METATILE_SIZE_PX,
-        TILE_SIZE,
         ProjectRenderSnapshot,
         XyzGpkgExporter,
-        compute_worker_count,
         normalise_metatile_size,
     )
 
@@ -109,8 +105,7 @@ TILE_FORMATS = ("PNG", "JPEG", "WEBP", "JPEG2000")
 
 # Feedback bridge limits. These exist purely to keep the dialog's log widget
 # from being flooded with queued cross-thread appends.
-FEEDBACK_MIN_INTERVAL_S = 0.25
-FEEDBACK_STATUS_INTERVAL_S = 1.0
+PROGRESS_EMIT_INTERVAL_S = 0.25
 FEEDBACK_MAX_ERRORS = 25
 FEEDBACK_MAX_WARNINGS = 25
 
@@ -152,24 +147,19 @@ _FLAG_REQUIRES_PROJECT = _resolve(
 class _FeedbackLogHandler(logging.Handler):
     """Mirrors the exporter's `logging` records into the Processing dialog.
 
-    Deliberately lossy. `QgsProcessingFeedback.push*()` emits a queued signal
-    that appends to a GUI text widget on the main thread; an unbounded feed
-    from a multi-million-tile run is what made the dialog stop responding.
+    The exporter emits only a few plain-language records at INFO - start,
+    finish, and anything that actually went wrong - so there is no volume to
+    throttle here any more. Identical consecutive messages still collapse, and
+    errors and warnings are capped in case a pathological project produces one
+    per layer.
 
-    Three limits apply:
-      * INFO records are dropped if one was pushed less than
-        `FEEDBACK_MIN_INTERVAL_S` ago (the exporter no longer logs per tile,
-        so this is only a safety net).
-      * Identical consecutive messages collapse into one.
-      * Errors and warnings are capped, with a single summary line when the
-        cap is reached. Nothing is lost overall - the full record still goes
-        to the Log Messages panel via the exporter's own handler.
+    No time-based gate: with only a handful of records left, an interval filter
+    would risk silently swallowing the finish message.
     """
 
     def __init__(self, feedback):
         super().__init__()
         self._feedback = feedback
-        self._last_info = 0.0
         self._last_message: Optional[str] = None
         self._errors = 0
         self._warnings = 0
@@ -202,10 +192,6 @@ class _FeedbackLogHandler(logging.Handler):
                         f"('{LOG_TAG}' tab) for the complete record."
                     )
             else:
-                now = time.monotonic()
-                if now - self._last_info < FEEDBACK_MIN_INTERVAL_S:
-                    return
-                self._last_info = now
                 self._feedback.pushInfo(message)
             self._last_message = message
         except Exception:
@@ -228,8 +214,6 @@ class _FeedbackBridge:
         self._handler = _FeedbackLogHandler(feedback)
         self._handler.setFormatter(logging.Formatter("%(message)s"))
         self._last_progress = 0.0
-        self._last_status_at = 0.0
-        self._last_status: Optional[str] = None
 
     def __enter__(self) -> "_FeedbackBridge":
         self._logger.addHandler(self._handler)
@@ -240,38 +224,20 @@ class _FeedbackBridge:
         return False
 
     def on_progress(self, done: int, total: int) -> None:
-        """Second throttle stage.
+        """Advance the progress bar. The percentage it displays is the only
+        place progress is shown - there is no status text duplicating it.
 
-        The exporter already ticks on an interval, but batch runs and future
-        callers may not, so the guarantee is enforced here too. `setProgress`
-        is a queued cross-thread emission and must never be driven per tile.
+        Second throttle stage: the exporter already ticks on an interval, but
+        batch runs and other callers may not, and `setProgress` is a queued
+        cross-thread emission that must never be driven per tile.
         """
         if total <= 0:
             return
         now = time.monotonic()
-        if done < total and (now - self._last_progress) < FEEDBACK_MIN_INTERVAL_S:
+        if done < total and (now - self._last_progress) < PROGRESS_EMIT_INTERVAL_S:
             return
         self._last_progress = now
         self._feedback.setProgress(min(100.0, 100.0 * done / total))
-
-    def on_status(self, message: str) -> None:
-        """Update the dialog's status line.
-
-        Throttled harder than progress: the exporter now ticks status with
-        absolute tile counts, and `setProgressText` is another queued
-        cross-thread emission, so it is limited to roughly once a second.
-        """
-        if message == self._last_status:
-            return
-        now = time.monotonic()
-        if now - self._last_status_at < FEEDBACK_STATUS_INTERVAL_S:
-            return
-        self._last_status_at = now
-        self._last_status = message
-        try:
-            self._feedback.setProgressText(message)
-        except AttributeError:
-            self._feedback.pushInfo(message)
 
 
 # --------------------------------------------------------------------------
@@ -337,8 +303,10 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
             "screen, because the label engine gets a screen-sized viewport instead of a single "
             "256 px tile. See the 'Metatile size' parameter.\n\n"
             "The export runs on low-priority background threads, always leaving one CPU core "
-            "for the interface, and reports progress on a fixed interval, so QGIS stays "
-            "responsive and Cancel takes effect promptly even on multi-million-tile jobs."
+            "for the interface, so QGIS stays responsive and Cancel takes effect promptly even "
+            "on multi-million-tile jobs. Progress is shown on the progress bar; the log records "
+            "only when the export starts, where the GeoPackage was saved, and anything that "
+            "went wrong."
         )
 
     def flags(self):
@@ -512,19 +480,11 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
                 self.tr(f"Could not configure the export: {exc}")
             ) from exc
 
-        block_tiles = metatile_size // TILE_SIZE
-        workers = compute_worker_count(cpu_percent)
-        feedback.pushInfo(self.tr(
-            f"Export configured: zoom {min_zoom}-{max_zoom}, {tile_format} @ {dpi} dpi, "
-            f"{len(snapshot.layers)} layer(s), {workers} render thread(s), "
-            f"{metatile_size}px metatiles ({block_tiles}x{block_tiles} tiles per render pass, "
-            f"~{metatile_size ** 2 * 4 / (1024 * 1024):.0f} MB per thread)."
-        ))
-        if block_tiles == 1:
-            feedback.pushInfo(self.tr(
-                "Metatiling is disabled at this size. Labels that do not fit inside a single "
-                "256 px tile will be dropped."
-            ))
+        # No configuration summary is pushed here. Zoom range, DPI, thread
+        # count and metatile geometry are all visible in the parameters panel
+        # the user just filled in, so repeating them in the log only buries the
+        # two messages that matter. The full configuration is recorded at DEBUG
+        # by the exporter for troubleshooting.
         return True
 
     # -- lifecycle: worker thread -----------------------------------------
@@ -537,26 +497,15 @@ class XyzGpkgExporterAlgorithm(QgsProcessingAlgorithm):
 
         with _FeedbackBridge(feedback) as bridge:
             exporter.progress_callback = bridge.on_progress
-            exporter.status_callback = bridge.on_status
             exporter.should_cancel = feedback.isCanceled
             try:
                 self._output_path = exporter.export()
             except Exception as exc:
                 raise QgsProcessingException(str(exc)) from exc
 
-        if exporter.cancelled or feedback.isCanceled():
-            feedback.pushInfo(self.tr("Export cancelled by user."))
-        else:
-            feedback.pushInfo(self.tr(
-                f"Export finished: {exporter.tiles_written:,} tile(s) written to "
-                f"{self._output_path}"
-            ))
-        if exporter.tiles_failed:
-            feedback.pushWarning(self.tr(
-                f"{exporter.tiles_failed:,} tile(s) failed to render. See the Log Messages "
-                f"panel ('{LOG_TAG}' tab) for details."
-            ))
-
+        # The exporter already emits the one start line and the one finish
+        # line (including the output path), which reach this dialog through the
+        # log bridge. Nothing is added here, to avoid duplicating them.
         return {
             self.OUTPUT_DIR: exporter.output_dir,
             self.OUTPUT_FILE: self._output_path or "",
