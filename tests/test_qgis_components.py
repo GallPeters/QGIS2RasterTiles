@@ -115,6 +115,29 @@ class FieldsExportProject(unittest.TestCase):
         self.assertEqual(set(analyze_layer_fields(self.layer("roads")).required), {"cls", "w"})
         self.assertEqual(set(analyze_layer_fields(self.layer("parks")).required), {"pname"})
 
+    def test_else_rules_are_not_parse_errors(self):
+        """ELSE rules (filter text 'ELSE') must not trigger the keep-all-fields fallback."""
+        from qgis.core import QgsMarkerSymbol, QgsPalLayerSettings, QgsRuleBasedLabeling, QgsRuleBasedRenderer
+        lyr = QgsVectorLayer("Point?crs=EPSG:4326&field=kind:string&field=junk:string&field=name:string", "t", "memory")
+        root = QgsRuleBasedRenderer.Rule(None)
+        root.appendChild(QgsRuleBasedRenderer.Rule(QgsMarkerSymbol.createSimple({}), 0, 0, "\"kind\" = 'a'", "a"))
+        else_rule = QgsRuleBasedRenderer.Rule(QgsMarkerSymbol.createSimple({}), 0, 0, "", "")
+        else_rule.setIsElse(True)
+        root.appendChild(else_rule)
+        lyr.setRenderer(QgsRuleBasedRenderer(root))
+        s = QgsPalLayerSettings()
+        s.fieldName = "name"
+        lroot = QgsRuleBasedLabeling.Rule(None)
+        lab_else = QgsRuleBasedLabeling.Rule(QgsPalLayerSettings(s), 0, 0, "", "")
+        lab_else.setIsElse(True)
+        lroot.appendChild(lab_else)
+        lyr.setLabeling(QgsRuleBasedLabeling(lroot))
+        lyr.setLabelsEnabled(True)
+        a = analyze_layer_fields(lyr)
+        self.assertFalse(a.keep_all, a.warnings)
+        self.assertEqual(set(a.required), {"kind", "name"})
+        self.assertEqual(a.warnings, [])
+
     def test_unparseable_expression_keeps_all(self):
         lyr = self.layer("parks").clone()
         s = lyr.labeling().settings()

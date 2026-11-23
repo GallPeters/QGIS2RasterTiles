@@ -160,9 +160,8 @@ def analyze_layer_fields(layer: QgsVectorLayer, project: Optional[QgsProject] = 
         if isinstance(lab, QgsRuleBasedLabeling):
             for rule in lab.rootRule().descendants():
                 w = f"label rule '{rule.description()}'"
-                c.add_expression(rule.filterExpression(), f"{w} filter")
-                if rule.filterExpression():
-                    c.add_fields(QgsExpression(rule.filterExpression()).referencedColumns(), f"{w} filter")
+                if not _is_else(rule):
+                    c.add_expression(rule.filterExpression(), f"{w} filter")
                 c.add_pal(rule.settings(), w)
         elif isinstance(lab, QgsVectorLayerSimpleLabeling):
             c.add_pal(lab.settings(), "labeling")
@@ -209,6 +208,12 @@ def analyze_layer_fields(layer: QgsVectorLayer, project: Optional[QgsProject] = 
                          sorted({e for _, e in c.expressions}))
 
 
+def _is_else(rule) -> bool:
+    """ELSE rules ("all other values") store the literal filter 'ELSE', which is not an
+    expression; they reference no fields of their own (their siblings' filters are analysed)."""
+    return rule.isElse() or rule.filterExpression().strip().upper() == "ELSE"
+
+
 def _collect_renderer(c: _Collector, renderer, where: str) -> None:
     c.add_fields(renderer.usedAttributes(c.rc), where)
     if renderer.orderByEnabled():
@@ -217,7 +222,7 @@ def _collect_renderer(c: _Collector, renderer, where: str) -> None:
     if isinstance(renderer, QgsRuleBasedRenderer):
         for rule in renderer.rootRule().descendants():
             w = f"{where} rule '{rule.label()}'"
-            if rule.filterExpression():
+            if rule.filterExpression() and not _is_else(rule):
                 c.add_expression(rule.filterExpression(), f"{w} filter")
             c.add_symbol(rule.symbol(), w)
     else:
