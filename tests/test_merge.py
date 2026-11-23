@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.merger import MergeError, merge_parts  # noqa: E402
 
 
-def make_part(path, tiles, zooms, table="tiles", tms=(4326, -180.0, -90.0, 180.0, 90.0), unique=True):
+def make_part(path, tiles, zooms, table="tiles", tms=(4326, -180.0, -90.0, 180.0, 90.0), unique=True,
+              bounds=(1, 2, 3, 4)):
     """Create a GeoPackage shaped like the one written by QGIS' tile writer."""
     con = sqlite3.connect(path)
     con.executescript(f"""
@@ -30,7 +31,8 @@ def make_part(path, tiles, zooms, table="tiles", tms=(4326, -180.0, -90.0, 180.0
     """)
     if unique:
         con.execute(f'CREATE UNIQUE INDEX uk_{table} ON "{table}" (zoom_level, tile_column, tile_row)')
-    con.execute("INSERT INTO gpkg_contents VALUES (?, 'tiles', ?, '', '2020', 1, 2, 3, 4, ?)", (table, table, tms[0]))
+    con.execute("INSERT INTO gpkg_contents VALUES (?, 'tiles', ?, '', '2020', ?, ?, ?, ?, ?)",
+                (table, table, *bounds, tms[0]))
     con.execute("INSERT INTO gpkg_tile_matrix_set VALUES (?,?,?,?,?,?)", (table, *tms))
     for z in zooms:
         con.execute("INSERT INTO gpkg_tile_matrix VALUES (?,?,?,?,256,256,?,?)",
@@ -105,6 +107,68 @@ class MergeTest(unittest.TestCase):
             fh.write(b"junk")
         rep = merge_parts([self.p("a.gpkg")], self.p("o.gpkg"), (0, 0, 1, 1), 12, 12, matrix_row)
         self.assertEqual(rep.total_tiles, 1)
+
+
+class MergeToolTest(unittest.TestCase):
+    """merge_tile_geopackages: the 'Merge XYZ tiles (GPKG)' tool."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def p(self, name):
+        return os.path.join(self.d, name)
+
+    def test_merge_zoom_ranges_with_gap(self):
+        from src.merger import merge_tile_geopackages
+        make_part(self.p("a.gpkg"), [(10, 1, 1), (11, 2, 2), (12, 4, 4)], [10, 11, 12], bounds=(34.0, 31.0, 35.0, 32.0))
+        make_part(self.p("b.gpkg"), [(15, 32, 32), (15, 33, 32)], [15], bounds=(34.5, 30.0, 36.0, 31.5))
+        with open(self.p("a.gpkg"), "rb") as fh:
+            before = fh.read()
+        rep = merge_tile_geopackages([self.p("a.gpkg"), self.p("b.gpkg")], self.p("out.gpkg"))
+        self.assertEqual(rep.tiles_per_zoom, {10: 1, 11: 1, 12: 1, 15: 2})
+        con = sqlite3.connect(self.p("out.gpkg"))
+        rows = {r[0]: r[1:] for r in con.execute(
+            "SELECT zoom_level, matrix_width, matrix_height, pixel_x_size FROM gpkg_tile_matrix")}
+        self.assertEqual(sorted(rows), [10, 11, 12, 13, 14, 15])  # gap zooms 13-14 added
+        for z in (13, 14):  # derived exactly like the existing rows
+            self.assertEqual(rows[z][:2], (2 << z, 1 << z))
+            self.assertAlmostEqual(rows[z][2], 180 / 256 / 2 ** z)
+        self.assertEqual(con.execute("SELECT min_x, min_y, max_x, max_y FROM gpkg_contents").fetchone(),
+                         (34.0, 30.0, 36.0, 32.0))  # union of the inputs' bounds
+        con.close()
+        with open(self.p("a.gpkg"), "rb") as fh:
+            self.assertEqual(fh.read(), before)  # input untouched
+
+    def test_first_input_wins_on_duplicates(self):
+        from src.merger import merge_tile_geopackages
+        make_part(self.p("a.gpkg"), [(12, 1, 1)], [12])
+        make_part(self.p("b.gpkg"), [(12, 1, 1), (12, 2, 1)], [12])
+        con = sqlite3.connect(self.p("b.gpkg"))
+        con.execute("UPDATE tiles SET tile_data=? WHERE tile_column=1", (b"from-b",))
+        con.commit()
+        con.close()
+        rep = merge_tile_geopackages([self.p("a.gpkg"), self.p("b.gpkg")], self.p("out.gpkg"))
+        self.assertEqual(rep.ignored_duplicates, 1)
+        con = sqlite3.connect(self.p("out.gpkg"))
+        self.assertEqual(con.execute("SELECT tile_data FROM tiles WHERE tile_column=1").fetchone()[0], b"img12_1_1")
+        con.close()
+
+    def test_rejects_bad_inputs(self):
+        from src.merger import merge_tile_geopackages
+        make_part(self.p("a.gpkg"), [(12, 1, 1)], [12])
+        make_part(self.p("b.gpkg"), [(12, 2, 1)], [12], tms=(3857, -1.0, -1.0, 1.0, 1.0))
+        with self.assertRaisesRegex(MergeError, "must not be one of the inputs"):
+            merge_tile_geopackages([self.p("a.gpkg")], self.p("a.gpkg"))
+        with self.assertRaisesRegex(MergeError, "matrix set differs"):
+            merge_tile_geopackages([self.p("a.gpkg"), self.p("b.gpkg")], self.p("out.gpkg"))
+        with open(self.p("junk.gpkg"), "wb") as fh:
+            fh.write(b"not a database")
+        with self.assertRaisesRegex(MergeError, "not a tile GeoPackage"):
+            merge_tile_geopackages([self.p("a.gpkg"), self.p("junk.gpkg")], self.p("out.gpkg"))
 
 
 if __name__ == "__main__":

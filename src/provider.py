@@ -8,6 +8,7 @@ from qgis.core import QgsProcessingProvider
 from qgis.PyQt.QtGui import QIcon
 
 from .algorithm import ParallelXyzTilesAlgorithm
+from .merge_algorithm import MergeTileGeoPackagesAlgorithm
 
 ICON = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icon.png")
 
@@ -27,3 +28,4 @@ class QGIS2RasterTilesProvider(QgsProcessingProvider):
 
     def loadAlgorithms(self) -> None:  # noqa: N802
         self.addAlgorithm(ParallelXyzTilesAlgorithm())
+        self.addAlgorithm(MergeTileGeoPackagesAlgorithm())

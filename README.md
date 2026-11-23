@@ -38,6 +38,9 @@ Processing Toolbox → **QGIS2RasterTiles** → **Parallel XYZ tiles (GPKG)**
 
 Run it again with the same inputs to resume an interrupted run.
 
+**Merge XYZ tiles (GPKG)** merges tile GeoPackages into one, e.g. a zooms 0–18 result and a zoom 19 result.
+The inputs must share the same tile matrix; a tile present in several inputs is taken from the first one.
+
 ## Settings
 
 All other settings are in [`defaults.json`](defaults.json) in the plugin folder:
