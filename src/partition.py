@@ -281,26 +281,37 @@ def partition_zoom(occ: ZoomOccupancy, cm: CostModel, target: float) -> List[Blo
     cells = [(i, j, c) for (i, j), c in occ.cells.items()]
     if not cells:
         return []
-    stack2: List[Tuple[int, int, int, int, list]] = [(0, g.meta_cols - 1, 0, g.meta_rows - 1, cells)]
-    while stack2:
-        i0, i1, j0, j1, cs = stack2.pop()
-        if not cs:
-            continue
-        # tighten to occupied cells
+
+    def solve(cs: list) -> Tuple[float, List[Block]]:
+        """Cheapest way (render cost + one start-up per job) to cover the cells ``cs``.
+
+        A block tightened to its cells is either one job, or split in quarters,
+        whichever costs less: splitting removes empty metatiles but every extra
+        job pays a start-up. Blocks heavier than ``target`` are always split
+        (load balancing). No split is tried when the empty metatiles cost less
+        than one start-up, as no split could pay off.
+        """
         i0 = min(c[0] for c in cs); i1 = max(c[0] for c in cs)  # noqa: E702
         j0 = min(c[1] for c in cs); j1 = max(c[1] for c in cs)  # noqa: E702
         n = (i1 - i0 + 1) * (j1 - j0 + 1)
         feats = sum(c[2] for c in cs)
-        occupied = len(cs)
-        wasted = (n - occupied) * cm.per_metatile
-        if n > 1 and (cm.cost(n, feats) > target or wasted > cm.startup):
-            for q in _quarters(i0, i1, j0, j1):
-                a0, a1, b0, b1 = q
-                sub = [c for c in cs if a0 <= c[0] <= a1 and b0 <= c[1] <= b1]
-                if sub:
-                    stack2.append((a0, a1, b0, b1, sub))
-        else:
-            out.append(Block(occ.zoom, i0, i1, j0, j1, occupied, feats))
+        base = cm.cost(n, feats)
+        leaf = (base + cm.startup, [Block(occ.zoom, i0, i1, j0, j1, len(cs), feats)])
+        if n == 1:
+            return leaf
+        must_split = base > target
+        if not must_split and (n - len(cs)) * cm.per_metatile <= cm.startup:
+            return leaf
+        total, blocks = 0.0, []
+        for a0, a1, b0, b1 in _quarters(i0, i1, j0, j1):
+            sub = [c for c in cs if a0 <= c[0] <= a1 and b0 <= c[1] <= b1]
+            if sub:
+                cost, bl = solve(sub)
+                total += cost
+                blocks.extend(bl)
+        return (total, blocks) if must_split or total < leaf[0] else leaf
+
+    out = solve(cells)[1]
     return _merge_blocks(out, cm, target)
 
 

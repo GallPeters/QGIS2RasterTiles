@@ -128,6 +128,35 @@ class PartitionTest(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual((merged[0].i0, merged[0].i1), (4, 6))
 
+    def test_no_swarm_of_tiny_jobs(self):
+        """Splitting must pay for the extra start-ups (regression: 17,000 jobs of ~2 s)."""
+        zo = ZoomOccupancy(self.g, EXTENT, 18, 8, 0)
+        # scattered small clusters: occupied 2x2 groups, 3 empty metatiles apart
+        for i in range(0, zo.mgrid.meta_cols - 1, 5):
+            for j in range(0, zo.mgrid.meta_rows - 1, 5):
+                for di in (0, 1):
+                    for dj in (0, 1):
+                        r = zo.metatile_rect(i + di, i + di, j + dj, j + dj)
+                        c = ((r.xmin + r.xmax) / 2, (r.ymin + r.ymax) / 2)
+                        zo.add_feature(Rect(c[0], c[1], c[0], c[1]))
+
+        def total_cost(blocks, cm):
+            return sum(b.workload(cm) for b in blocks) + len(blocks) * cm.startup
+
+        expensive = CostModel(0.15, 0.0, startup=3.0)
+        cheap = CostModel(0.15, 0.0, startup=0.01)
+        blocks_exp = partition_zoom(zo, expensive, target=1e9)
+        blocks_cheap = partition_zoom(zo, cheap, target=1e9)
+        n_groups = len(zo.cells) // 4
+        # with a 3 s start-up a separate job per cluster costs more than rendering the gaps
+        self.assertLess(len(blocks_exp), n_groups / 4)
+        # with a cheap start-up it does split around the empty gaps
+        self.assertGreater(len(blocks_cheap), len(blocks_exp))
+        # and each plan is never worse than one single block
+        g = zo.mgrid
+        single = CostModel(0.15, 0.0, 3.0).cost(g.count, 0) + 3.0
+        self.assertLessEqual(total_cost(blocks_exp, expensive), single)
+
     def test_choose_split_zoom(self):
         z = choose_split_zoom(self.g, EXTENT, 0, 19, 20000)
         self.assertGreater(self.g.tile_range(EXTENT, z).count, 20000)

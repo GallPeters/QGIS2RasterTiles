@@ -114,6 +114,7 @@ def validate_part(path: str) -> bool:
 def merge_parts(parts: Sequence[str], output: str, full_extent: Tuple[float, float, float, float],
                 zoom_min: int, zoom_max: int, matrix_row: Callable[[int], MatrixRow],
                 vacuum: bool = False, progress: Optional[Callable[[float], None]] = None,
+                expect_duplicates: bool = False,
                 is_canceled: Optional[Callable[[], bool]] = None) -> MergeReport:
     """Merge ``parts`` into ``output``.
 
@@ -222,5 +223,6 @@ def merge_parts(parts: Sequence[str], output: str, full_extent: Tuple[float, flo
                 raise MergeError(f"tile count mismatch at zoom {z}: merged {per_zoom.get(z, 0)}, "
                                  f"parts {expected.get(z, 0)}")
     else:
-        log.warning("%d duplicate tiles were ignored while merging (parts overlapped)", ignored)
+        (log.debug if expect_duplicates else log.warning)(
+            "%d duplicate tiles were ignored while merging (parts overlapped)", ignored)
     return report

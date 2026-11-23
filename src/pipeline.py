@@ -58,6 +58,8 @@ from .tile_grid import Rect, TileGrid, TileRange
 log = logging.getLogger("qgis2rastertiles.pipeline")
 
 PIPELINE_VERSION = "2"
+#: version of the partitioning; a plan.json from an older planner is re-planned on resume
+PLAN_VERSION = "2"
 #: exported source feature id ($id): feature accounting and, optionally, drawing order
 ID_FIELD = "_pxyz_fid"
 
@@ -267,6 +269,7 @@ class Pipeline:
         log.info("Merging %d part(s) ...", len(parts))
         report = merge_parts(parts, final, (e.xmin, e.ymin, e.xmax, e.ymax), inp.zoom_min, inp.zoom_max,
                              self.matrix_row, vacuum=cfg.vacuum,
+                             expect_duplicates=bool(plan.stats.get("replanned")),
                              progress=lambda f: self.progress(95, 5, f), is_canceled=self.canceled)
         self.timings["merge"] = time.monotonic() - t0
         for z in range(inp.zoom_min, inp.zoom_max + 1):
@@ -425,10 +428,16 @@ class Pipeline:
         inp, cfg = self.inp, self.cfg
         plan_path = work / "plan.json"
         prev = _read_json(plan_path)
-        if prev:
+        carried: List[Job] = []
+        if prev and prev.get("version") == PLAN_VERSION:
             plan = PartitionPlan.from_dict(prev)
             log.info("Resuming: reusing the plan with %d job(s)", len(plan.jobs))
             return plan
+        if prev:
+            # plan made by an older planner: keep its finished jobs, re-plan only the rest
+            done = Manifest(work / "manifest.json", "").done_ids(validate_part)
+            carried = [j for j in PartitionPlan.from_dict(prev).jobs if j.job_id in done]
+            log.info("Resuming with a new plan: %d finished job(s) kept, re-planning the rest", len(carried))
 
         total_features = sum(v["count"] for v in exports.values())
         split = cfg.split_zoom if cfg.split_zoom != "auto" else choose_split_zoom(
@@ -474,8 +483,26 @@ class Pipeline:
         elif split <= inp.zoom_max:
             log.debug("skip_empty_tiles is false: every block is rendered (no occupancy skipping)")
 
+        if occ is not None and carried:
+            # areas already rendered by finished jobs need no new job
+            for j in carried:
+                zo = occ.zooms.get(j.zoom_min) if j.tile_range is not None else None
+                if zo is None or zo.all_occupied:
+                    continue
+                r = j.tile_range
+                box = zo.mgrid.meta_index_range((r.min_col, r.max_col), (r.min_row, r.max_row))
+                if box is not None:
+                    i0, i1, j0, j1 = box
+                    for c in [c for c in zo.cells if i0 <= c[0] <= i1 and j0 <= c[1] <= j1]:
+                        del zo.cells[c]
+
         plan = build_plan(self.grid, inp.extent, inp.zoom_min, inp.zoom_max, cfg.metatile_size, split, occ, cm,
                           jobs_n, total_features)
+        if carried:
+            ids = {j.job_id for j in carried}
+            plan.jobs = carried + [j for j in plan.jobs if j.job_id not in ids]
+            plan.stats["jobs"] = len(plan.jobs)
+            plan.stats["replanned"] = 1  # finished parts may overlap new blocks: identical duplicates expected
         if not plan.jobs:
             # nothing to render at all: one single-tile job still creates a valid, empty GeoPackage
             tr = self.grid.tile_range(inp.extent, inp.zoom_min)
@@ -488,9 +515,13 @@ class Pipeline:
         if plan.split_zoom > inp.zoom_max:
             log.info("Plan: 1 job over the full extent (small area, nothing to split)")
             log.debug("%d metatiles, estimated %.0fs", s["planned_metatiles"], s["estimated_serial_s"])
-            _write_json(plan_path, plan.to_dict())
+            _write_json(plan_path, {"version": PLAN_VERSION, **plan.to_dict()})
             return plan
-        log.info("Plan: %d job(s); %.0f%% of the map is empty and skipped", s["jobs"], 100 * s["work_saved_share"])
+        if carried:
+            log.info("Plan: %d job(s), %d of them already done", s["jobs"], len(carried))
+        else:
+            log.info("Plan: %d job(s); %.0f%% of the map is empty and skipped", s["jobs"],
+                     100 * s["work_saved_share"])
         log.debug("Partitioned zooms %d-%d: %d of %d metatiles occupied; metatiles to render %d of %d (single run); "
                   "estimated %.0fs serial, %.0fs with %d worker(s) (job start-up %.1fs)",
                   plan.split_zoom, inp.zoom_max, s["partitioned_metatiles_occupied"],
@@ -500,7 +531,7 @@ class Pipeline:
             zj = [j for j in plan.jobs if j.tile_range is not None and j.zoom_min == z]
             if zj:
                 log.debug("  zoom %2d: %d job(s), %d metatiles", z, len(zj), sum(j.metatiles for j in zj))
-        _write_json(plan_path, plan.to_dict())
+        _write_json(plan_path, {"version": PLAN_VERSION, **plan.to_dict()})
         return plan
 
     def job_startup(self, work: Path, runner: QgisProcessRunner) -> float:

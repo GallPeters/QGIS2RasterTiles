@@ -27,7 +27,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 log = logging.getLogger("qgis2rastertiles." + __name__.rsplit(".", 1)[-1])
 
@@ -160,7 +160,13 @@ def find_qgis_process(prefix_path: str, expected_version: Optional[str] = None,
 # Manifest (resume support)
 # ---------------------------------------------------------------------------
 class Manifest:
-    """JSON file listing completed job ids; written atomically after every job."""
+    """JSON file listing completed job ids; written atomically after every job.
+
+    A job id names its zoom range and tile range (e.g. ``z19_c625599-625654_r168700-168771``)
+    and the manifest lives in a work folder that is specific to the exact inputs, so a
+    finished job stays valid when the plan changes (e.g. re-planned by a newer version):
+    completed jobs are kept regardless of ``plan_key``, as long as their output is valid.
+    """
 
     def __init__(self, path: Path, plan_key: str) -> None:
         self.path = Path(path)
@@ -170,10 +176,13 @@ class Manifest:
         if self.path.is_file():
             try:
                 data = json.loads(self.path.read_text(encoding="utf-8"))
-                if data.get("plan_key") == plan_key:
-                    self.completed = data.get("completed", {})
+                self.completed = data.get("completed", {})
             except (OSError, ValueError):
                 log.warning("Ignoring unreadable manifest %s", self.path)
+
+    def done_ids(self, validate: Optional[Callable[[str], bool]] = None) -> Set[str]:
+        """Ids of completed jobs whose output is still valid."""
+        return {j for j in self.completed if self.is_done(j, validate)}
 
     def is_done(self, job_id: str, validate: Optional[Callable[[str], bool]] = None) -> bool:
         rec = self.completed.get(job_id)

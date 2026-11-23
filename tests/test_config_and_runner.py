@@ -89,14 +89,16 @@ class LocatorTest(unittest.TestCase):
 
 
 class ManifestTest(unittest.TestCase):
-    def test_resume_only_same_plan(self):
+    def test_resume_by_job_id_and_valid_output(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d, "part.gpkg")
             out.write_bytes(b"x")
             m = Manifest(Path(d, "manifest.json"), "plan-A")
             m.mark_done("job1", str(out), 1.5)
             self.assertTrue(Manifest(Path(d, "manifest.json"), "plan-A").is_done("job1"))
-            self.assertFalse(Manifest(Path(d, "manifest.json"), "plan-B").is_done("job1"))
+            # a re-planned run keeps finished jobs (ids name the exact tile range)
+            self.assertTrue(Manifest(Path(d, "manifest.json"), "plan-B").is_done("job1"))
+            self.assertEqual(Manifest(Path(d, "manifest.json"), "plan-B").done_ids(), {"job1"})
             out.unlink()
             self.assertFalse(Manifest(Path(d, "manifest.json"), "plan-A").is_done("job1"))
 
