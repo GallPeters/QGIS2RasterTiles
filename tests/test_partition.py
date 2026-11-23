@@ -157,6 +157,30 @@ class PartitionTest(unittest.TestCase):
         single = CostModel(0.15, 0.0, 3.0).cost(g.count, 0) + 3.0
         self.assertLessEqual(total_cost(blocks_exp, expensive), single)
 
+    def test_heavy_low_zooms_are_split_and_fully_covered(self):
+        """The full-extent low zooms must not become one huge job (they render every feature)."""
+        cm = CostModel(0.01, 0.0005, startup=1.0)
+        occ = Occupancy(self.g, EXTENT, range(16, 18), 8, 0)
+        self._points(occ, 500)
+        plan = build_plan(self.g, EXTENT, 8, 17, 4, 16, occ, cm, max_jobs=8, total_features=1_000_000)
+        low = [j for j in plan.jobs if j.zoom_min < 16]
+        self.assertGreater(len(low), 1)
+        for z in range(8, 16):
+            full = self.g.tile_range(EXTENT, z)
+            group = [j for j in low if j.tile_range is None and j.zoom_min <= z <= j.zoom_max]
+            blocks = [j for j in low if j.tile_range is not None and j.zoom_min == z]
+            self.assertTrue(bool(group) != bool(blocks), f"zoom {z} must be in exactly one form")
+            if blocks:
+                self.assertEqual(sum(j.tile_range.count for j in blocks), full.count)
+                mg = self.g.metatile_grid(EXTENT, z, 4)
+                for j in blocks:  # aligned to the single run's metatiles
+                    self.assertEqual((j.tile_range.min_col - mg.range.min_col) % 4, 0)
+                    self.assertEqual((j.tile_range.min_row - mg.range.min_row) % 4, 0)
+            else:
+                self.assertEqual(group[0].extent, EXTENT)
+        biggest = max(j.workload for j in plan.jobs)
+        self.assertLess(biggest, sum(j.workload for j in plan.jobs) / 4)
+
     def test_choose_split_zoom(self):
         z = choose_split_zoom(self.g, EXTENT, 0, 19, 20000)
         self.assertGreater(self.g.tile_range(EXTENT, z).count, 20000)

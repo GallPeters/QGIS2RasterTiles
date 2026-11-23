@@ -373,14 +373,13 @@ def build_plan(grid: TileGrid, extent: Rect, zoom_min: int, zoom_max: int, metat
     split_zoom = max(split_zoom, zoom_min)
     jobs: List[Job] = []
     full_metatiles = {z: grid.metatile_grid(extent, z, metatile_size).count for z in range(zoom_min, zoom_max + 1)}
-
-    if split_zoom > zoom_min:
-        zmax_low = min(split_zoom - 1, zoom_max)
-        mt = sum(full_metatiles[z] for z in range(zoom_min, zmax_low + 1))
-        feats = total_features * (zmax_low - zoom_min + 1)
-        jobs.append(Job(f"full_z{zoom_min}-{zmax_low}", zoom_min, zmax_low, extent, mt, feats, cm.cost(mt, feats)))
+    zmax_low = min(split_zoom - 1, zoom_max)
+    low_zooms = list(range(zoom_min, zmax_low + 1))
+    # every low zoom renders all features once over the full extent
+    low_cost = {z: cm.cost(full_metatiles[z], total_features) for z in low_zooms}
 
     occupied_total = 0
+    hi_load = 0.0
     if split_zoom <= zoom_max:
         if occupancy is None:
             occupancy = Occupancy(grid, extent, range(split_zoom, zoom_max + 1), metatile_size, 0)
@@ -388,14 +387,42 @@ def build_plan(grid: TileGrid, extent: Rect, zoom_min: int, zoom_max: int, metat
             for zo in occupancy.zooms.values():
                 zo.total_features = total_features
         # total workload of the occupied area (before splitting) to size the blocks
-        hi_load = 0.0
         for z in range(split_zoom, zoom_max + 1):
             zo = occupancy.zooms[z]
             feats = zo.total_features if zo.all_occupied else sum(zo.cells.values())
             hi_load += cm.cost(zo.occupied_count, feats)
             occupied_total += zo.occupied_count
-        total = hi_load + sum(j.workload for j in jobs)
-        target = max(total / (max(1, max_jobs) * 4), 4 * cm.startup, 1e-9)
+    total = hi_load + sum(low_cost.values())
+    target = max(total / (max(1, max_jobs) * 4), 4 * cm.startup, 1e-9)
+
+    # Low zooms: a job over the FULL extent has exactly the single run's metatiles, for
+    # any set of zooms. Cheap consecutive zooms share one job; a zoom heavier than the
+    # target is cut into blocks of its own metatiles (all occupied), like the high zooms.
+    group: List[int] = []
+
+    def flush() -> None:
+        if group:
+            mt = sum(full_metatiles[z] for z in group)
+            feats = total_features * len(group)
+            jobs.append(Job(f"full_z{group[0]}-{group[-1]}", group[0], group[-1], extent, mt, feats,
+                            cm.cost(mt, feats)))
+            group.clear()
+
+    for z in low_zooms:
+        if low_cost[z] > target and full_metatiles[z] > 1:
+            flush()
+            zo = ZoomOccupancy(grid, extent, z, metatile_size, 0)
+            zo.mark_all()
+            zo.total_features = total_features
+            for b in partition_zoom(zo, cm, target):
+                jobs.append(block_to_job(grid, zo, b, cm))
+            continue
+        if group and sum(low_cost[g] for g in group) + low_cost[z] > target:
+            flush()
+        group.append(z)
+    flush()
+
+    if split_zoom <= zoom_max:
         for z in range(split_zoom, zoom_max + 1):
             zo = occupancy.zooms[z]
             for b in partition_zoom(zo, cm, target):

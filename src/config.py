@@ -24,9 +24,10 @@ DEFAULTS_PATH = Path(__file__).resolve().parent.parent / "defaults.json"
 ADVANCED_DEFAULTS: Dict[str, Any] = {
     # split_zoom "auto": first zoom whose full-extent tile count exceeds this.
     "split_tile_threshold": 20000,
-    # Workload model (seconds). Only relative values matter for balancing,
-    # but they are compared with the measured job start-up time.
-    "cost_per_metatile_s": 0.15,
+    # Workload model (seconds), compared with the job start-up time when deciding
+    # whether to split. "auto" = measure the cost of an empty metatile with a
+    # probe job before planning (recommended), or a fixed number of seconds.
+    "cost_per_metatile_s": "auto",
     "cost_per_feature_s": 0.0005,
     # "auto" = measure qgis_process start-up + project load once, or a number of seconds.
     "job_startup_s": "auto",
@@ -83,7 +84,7 @@ class TileConfig:
     edge_margin_px: float
     keep_temp_files: bool
     split_tile_threshold: int = 20000
-    cost_per_metatile_s: float = 0.15
+    cost_per_metatile_s: Union[str, float] = "auto"
     cost_per_feature_s: float = 0.0005
     job_startup_s: Union[str, float] = "auto"
     ram_per_job_gb: float = 2.0
@@ -172,8 +173,9 @@ def validate_config(raw: Dict[str, Any]) -> TileConfig:
          "split_zoom must be 'auto' or an integer 0..25")
     need(_is_num(v["edge_margin_px"]) and v["edge_margin_px"] >= 0, "edge_margin_px must be a number >= 0")
     need(_is_int(v["split_tile_threshold"]) and v["split_tile_threshold"] >= 1, "split_tile_threshold must be an integer >= 1")
-    for k in ("cost_per_metatile_s", "cost_per_feature_s"):
-        need(_is_num(v[k]) and v[k] >= 0, f"{k} must be a number >= 0")
+    need(v["cost_per_metatile_s"] == "auto" or (_is_num(v["cost_per_metatile_s"]) and v["cost_per_metatile_s"] > 0),
+         "cost_per_metatile_s must be 'auto' or a number > 0")
+    need(_is_num(v["cost_per_feature_s"]) and v["cost_per_feature_s"] >= 0, "cost_per_feature_s must be a number >= 0")
     need(v["job_startup_s"] == "auto" or (_is_num(v["job_startup_s"]) and v["job_startup_s"] >= 0),
          "job_startup_s must be 'auto' or a number >= 0")
     need(_is_num(v["ram_per_job_gb"]) and v["ram_per_job_gb"] > 0, "ram_per_job_gb must be a number > 0")

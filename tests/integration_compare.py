@@ -95,6 +95,7 @@ def main() -> int:
     ap.add_argument("--split", default="13")
     ap.add_argument("--jobs", default="4", help="number of parallel processes, or 'auto' (adaptive)")
     ap.add_argument("--ram-per-job", type=float, default=None, help="override ram_per_job_gb")
+    ap.add_argument("--feature-cost", type=float, default=None, help="override cost_per_feature_s (planning only)")
     ap.add_argument("--points", type=int, default=400)
     ap.add_argument("--startup", default="0.5", help="job_startup_s ('auto' to measure)")
     ap.add_argument("--project", default=None)
@@ -111,6 +112,7 @@ def main() -> int:
     cfg = dataclasses.replace(
         base_cfg, metatile_size=a.metatile, max_parallel_jobs=a.jobs if a.jobs == "auto" else int(a.jobs),
         ram_per_job_gb=a.ram_per_job or base_cfg.ram_per_job_gb,
+        cost_per_feature_s=a.feature_cost if a.feature_cost is not None else base_cfg.cost_per_feature_s,
         split_zoom=a.split if a.split == "auto" else int(a.split),
         job_startup_s=a.startup if a.startup == "auto" else float(a.startup), keep_temp_files=True)
     print("Config:", json.dumps(cfg.to_dict()))

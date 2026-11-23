@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,7 +60,10 @@ log = logging.getLogger("qgis2rastertiles.pipeline")
 
 PIPELINE_VERSION = "2"
 #: version of the partitioning; a plan.json from an older planner is re-planned on resume
-PLAN_VERSION = "2"
+PLAN_VERSION = "3"
+#: empty-metatile cost when it cannot be measured, and the lowest measured value accepted (seconds)
+DEFAULT_METATILE_S = 0.03
+MIN_METATILE_S = 0.002
 #: exported source feature id ($id): feature accounting and, optionally, drawing order
 ID_FIELD = "_pxyz_fid"
 
@@ -445,11 +449,6 @@ class Pipeline:
         split = max(split, inp.zoom_min)
         log.debug("Step 5: split zoom = %d (%s)", split, "auto" if cfg.split_zoom == "auto" else "defaults.json")
 
-        startup = 0.0
-        if split <= inp.zoom_max:
-            startup = self.job_startup(work, runner)
-        cm = CostModel(cfg.cost_per_metatile_s, cfg.cost_per_feature_s, startup)
-
         occ = None
         if split <= inp.zoom_max and cfg.skip_empty_tiles:
             occ = Occupancy(self.grid, inp.extent, range(split, inp.zoom_max + 1), cfg.metatile_size,
@@ -482,6 +481,13 @@ class Pipeline:
                     log.debug("  occupancy: %s (not vector) marks its whole extent", lyr.name())
         elif split <= inp.zoom_max:
             log.debug("skip_empty_tiles is false: every block is rendered (no occupancy skipping)")
+
+        startup, per_metatile = 0.0, DEFAULT_METATILE_S
+        if split <= inp.zoom_max:
+            startup, per_metatile = self.calibrate(work, runner, occ)
+        elif cfg.cost_per_metatile_s != "auto":
+            per_metatile = float(cfg.cost_per_metatile_s)
+        cm = CostModel(per_metatile, cfg.cost_per_feature_s, startup)
 
         if occ is not None and carried:
             # areas already rendered by finished jobs need no new job
@@ -535,32 +541,83 @@ class Pipeline:
         return plan
 
     def job_startup(self, work: Path, runner: QgisProcessRunner) -> float:
-        """qgis_process start-up + project load, measured once with a one-tile job."""
-        if self.cfg.job_startup_s != "auto":
-            return float(self.cfg.job_startup_s)
-        cache = work / "startup.json"
-        prev = _read_json(cache)
-        if prev and "seconds" in prev:
-            return float(prev["seconds"])
-        inp = self.inp
-        tr = self.grid.tile_range(inp.extent, inp.zoom_min)
-        one = TileRange(tr.zoom, tr.min_col, tr.min_col, tr.min_row, tr.min_row)
-        out = str(work / "startup_probe.gpkg")
-        spec = JobSpec("startup_probe", inp.mapping.job_inputs(self.cfg, self.grid.job_extent(one), inp.target_crs,
-                                                                one.zoom, one.zoom, out), out)
-        import threading
+        """qgis_process start-up + project load (seconds), from :meth:`calibrate`."""
+        return self.calibrate(work, runner, None)[0]
+
+    def _probe(self, work: Path, runner: QgisProcessRunner, name: str, tr: TileRange) -> float:
+        """Wall time of one built-in run over exactly the tile range ``tr``."""
+        out = str(work / f"{name}.gpkg")
+        spec = JobSpec(name, self.inp.mapping.job_inputs(self.cfg, self.grid.job_extent(tr), self.inp.target_crs,
+                                                          tr.zoom, tr.zoom, out), out)
         t0 = time.monotonic()
         try:
             runner.run_once(spec, 1, threading.Event())
         except JobFailed as e:
-            raise PipelineError(f"the built-in algorithm failed on a one-tile test job: {e}") from e
+            raise PipelineError(f"the built-in algorithm failed on a test job: {e}") from e
         secs = time.monotonic() - t0
-        log.debug("Measured qgis_process start-up + project load: %.1fs", secs)
-        _write_json(cache, {"seconds": secs})
         for suffix in ("", "-wal", "-shm"):
             if os.path.exists(out + suffix):
                 os.remove(out + suffix)
         return secs
+
+    def calibrate(self, work: Path, runner: QgisProcessRunner, occ: Optional[Occupancy]):
+        """Measure (job start-up s, empty-metatile s) on this machine, with this project.
+
+        * start-up: a one-tile job, run twice, the faster run counts;
+        * empty metatile: a block of up to 16x16 metatiles at the maximum zoom in
+          an area without features; (block time - start-up) / metatiles.
+
+        The planner weighs exactly these two against each other when it decides
+        whether a separate job for a small group of features pays off.
+        Values from defaults.json (numbers instead of "auto") are used as given.
+        """
+        cfg, inp = self.cfg, self.inp
+        cache = work / "calibration.json"
+        prev = _read_json(cache) or {}
+        startup = None if cfg.job_startup_s == "auto" else float(cfg.job_startup_s)
+        per = None if cfg.cost_per_metatile_s == "auto" else float(cfg.cost_per_metatile_s)
+        if startup is None:
+            startup = prev.get("startup")
+        if per is None:
+            per = prev.get("per_metatile")
+        if startup is not None and per is not None:
+            return float(startup), float(per)
+
+        tr = self.grid.tile_range(inp.extent, inp.zoom_min)
+        one = TileRange(tr.zoom, tr.min_col, tr.min_col, tr.min_row, tr.min_row)
+        measured_startup = min(self._probe(work, runner, "probe_startup", one) for _ in range(2))
+        if startup is None:
+            startup = measured_startup
+        if per is None:
+            block = self._empty_block(occ)
+            if block is None:
+                per = DEFAULT_METATILE_S
+                log.debug("No empty area to measure the metatile cost: using %.3fs", per)
+            else:
+                tr_block, n = block
+                t = self._probe(work, runner, "probe_metatiles", tr_block)
+                per = max(MIN_METATILE_S, (t - measured_startup) / max(1, n - 1))
+                log.debug("Probe: %d empty metatiles at zoom %d in %.1fs", n, tr_block.zoom, t)
+        log.info("Measured: job start-up %.1fs, empty metatile %.0f ms", startup, per * 1000)
+        _write_json(cache, {"startup": startup, "per_metatile": per})
+        return float(startup), float(per)
+
+    def _empty_block(self, occ: Optional[Occupancy], size: int = 16):
+        """(tile range, metatile count) of a square block of empty metatiles at the highest zoom, or None."""
+        if occ is None:
+            return None
+        zo = occ.zooms[max(occ.zooms)]
+        if zo.all_occupied:
+            return None
+        g = zo.mgrid
+        for k in (size, 8, 4):
+            if g.meta_cols < k or g.meta_rows < k:
+                continue
+            for i0 in range(0, g.meta_cols - k + 1, k):
+                for j0 in range(0, g.meta_rows - k + 1, k):
+                    if not any((i, j) in zo.cells for i in range(i0, i0 + k) for j in range(j0, j0 + k)):
+                        return g.tile_span(i0, i0 + k - 1, j0, j0 + k - 1), k * k
+        return None
 
 
 def verify_coverage(occ: Occupancy, plan: PartitionPlan) -> None:
