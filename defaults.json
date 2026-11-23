@@ -1,0 +1,19 @@
+{
+  "background_color": "transparent",
+  "tile_format": "PNG",
+  "tile_width": 256,
+  "tile_height": 256,
+  "dpi": 96,
+  "antialias": true,
+  "quality": 75,
+  "metatile_size": 8,
+  "skip_empty_tiles": true,
+  "target_crs": "EPSG:4326",
+  "zoom0_extent": [-180, 180, -90, 90],
+  "zoom0_matrix_width": 2,
+  "zoom0_matrix_height": 1,
+  "max_parallel_jobs": "auto",
+  "split_zoom": "auto",
+  "edge_margin_px": 100,
+  "keep_temp_files": false
+}

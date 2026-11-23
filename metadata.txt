@@ -1,0 +1,19 @@
+[general]
+name=QGIS2RasterTiles
+qgisMinimumVersion=4.3
+qgisMaximumVersion=4.99
+supportsQt6=True
+description=Generate XYZ raster tiles into a GeoPackage much faster, with the same result as the built-in tool.
+about=Runs QGIS's built-in "Generate XYZ tiles (GeoPackage)" in parallel processes and renders high zoom levels only where the project has features. The output is identical to a single run of the built-in tool. Requires QGIS 4.3 or later.
+version=0.1
+author=Jossef Kanter
+email=jossefkan@gmail.com
+homepage=https://github.com/GallPeters/QGIS2RasterTiles
+repository=https://github.com/GallPeters/QGIS2RasterTiles
+tracker=https://github.com/GallPeters/QGIS2RasterTiles/issues
+tags=xyz, tiles, raster tiles, geopackage, gpkg, tile cache, processing, parallel, cartography, web
+icon=icon.png
+experimental=True
+deprecated=False
+hasProcessingProvider=yes
+changelog=0.1 - First public release.

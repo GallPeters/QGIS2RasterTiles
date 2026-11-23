@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.vscode/
+.claude/
+# test outputs
+tests/_integration*/
+# SQLite temporary files of a GeoPackage open in QGIS
+*.gpkg-shm
+*.gpkg-wal
+# QGIS headless runs may create this in the working directory
+symbology-style.db
