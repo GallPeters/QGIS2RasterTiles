@@ -76,6 +76,22 @@ class LocatorTest(unittest.TestCase):
             c2 = qgis_process_candidates(str(Path(root, "apps", "qgis")), platform="win32")
             self.assertEqual(c2[0].name, "qgis_process-qgis.bat")
 
+    def test_job_priority(self):
+        from src.job_runner import BELOW_NORMAL_PRIORITY_CLASS, QgisProcessRunner, _creationflags
+        cfg = load_config()
+        self.assertEqual(cfg.job_priority, "normal")  # default: all cores (below normal can be confined)
+        with self.assertRaisesRegex(ConfigError, "job_priority"):
+            validate_config({**cfg.to_dict(), "job_priority": "high"})
+        with tempfile.TemporaryDirectory() as d:
+            normal = QgisProcessRunner(Path("qp"), "alg", "p.qgz", Path(d))
+            low = QgisProcessRunner(Path("qp"), "alg", "p.qgz", Path(d), priority="below_normal")
+            self.assertFalse(normal.below_normal)
+            self.assertTrue(low.below_normal)
+            self.assertNotIn("nice", normal.command())
+        if sys.platform == "win32":
+            self.assertFalse(_creationflags(False) & BELOW_NORMAL_PRIORITY_CLASS)
+            self.assertTrue(_creationflags(True) & BELOW_NORMAL_PRIORITY_CLASS)
+
     def test_profile_arguments(self):
         from src.job_runner import profile_arguments
         a = profile_arguments("C:/Users/u/AppData/Roaming/QGIS/QGIS4/profiles/work/")

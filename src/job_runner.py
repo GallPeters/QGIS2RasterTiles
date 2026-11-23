@@ -243,7 +243,8 @@ class QgisProcessRunner:
 
     def __init__(self, qgis_process: Path, algorithm_id: str, project_path: str, log_dir: Path,
                  ellipsoid: Optional[str] = None, skip_plugins: bool = True,
-                 env: Optional[Dict[str, str]] = None, profile_args: Sequence[str] = ()) -> None:
+                 env: Optional[Dict[str, str]] = None, profile_args: Sequence[str] = (),
+                 priority: str = "normal") -> None:
         self.qgis_process = Path(qgis_process)
         self.algorithm_id = algorithm_id
         self.project_path = project_path
@@ -253,11 +254,14 @@ class QgisProcessRunner:
         self.skip_plugins = skip_plugins
         self.env = env
         self.profile_args = list(profile_args)
+        # "normal" (default) or "below_normal". Below normal keeps the PC more responsive, but
+        # Windows may then confine the processes to a few (efficiency) cores and leave most idle.
+        self.below_normal = priority == "below_normal"
 
     def base_command(self, skip_plugins: Optional[bool] = None) -> List[str]:
         """qgis_process with the global options (priority, plugins, user profile)."""
         cmd = []
-        if not IS_WINDOWS and shutil.which("nice"):
+        if self.below_normal and not IS_WINDOWS and shutil.which("nice"):
             cmd += ["nice", "-n", "5"]  # lower priority, like BELOW_NORMAL on Windows
         cmd.append(str(self.qgis_process))
         if self.skip_plugins if skip_plugins is None else skip_plugins:
@@ -281,7 +285,7 @@ class QgisProcessRunner:
         for suffix in ("", "-wal", "-shm", "-journal"):
             if os.path.exists(spec.output + suffix):
                 os.remove(spec.output + suffix)
-        popen_kw: Dict[str, Any] = ({"creationflags": _creationflags(below_normal=True)} if IS_WINDOWS
+        popen_kw: Dict[str, Any] = ({"creationflags": _creationflags(below_normal=self.below_normal)} if IS_WINDOWS
                                     else {"start_new_session": True})
         with open(out_log, "w", encoding="utf-8", errors="replace") as fo, \
                 open(err_log, "w", encoding="utf-8", errors="replace") as fe:

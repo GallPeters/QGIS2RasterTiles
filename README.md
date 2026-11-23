@@ -50,6 +50,7 @@ plus:
 | `split_zoom` | `auto` | zooms below it run as one job; zooms from it up are split into areas |
 | `edge_margin_px` | 100 | how far symbols and labels reach beyond their feature, in pixels |
 | `keep_temp_files` | false | keep the intermediate files |
+| `job_priority` | `normal` | priority of the parallel processes; `below_normal` keeps the PC more responsive, but Windows may then use only a few cores |
 
 Tuning:
 

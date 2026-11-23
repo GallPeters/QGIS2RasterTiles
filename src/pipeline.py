@@ -145,7 +145,7 @@ class Pipeline:
     def work_key(self) -> str:
         cfg = self.cfg.to_dict()
         for k in ("max_parallel_jobs", "keep_temp_files", "vacuum", "qgis_process_skip_plugins",
-                  "qgis_process_path", "output_filename", "ram_per_job_gb", "max_job_retries"):
+                  "qgis_process_path", "output_filename", "ram_per_job_gb", "max_job_retries", "job_priority"):
             cfg.pop(k, None)
         e = self.inp.extent
         return _sha({
@@ -233,7 +233,7 @@ class Pipeline:
             log.debug("qgis_process user profile: %s", " ".join(profile[1:2]) or "(qgis_process default)")
             runner = QgisProcessRunner(qp, inp.mapping.algorithm_id, project_path, work / "logs",
                                        ellipsoid=snap.ellipsoid or None, skip_plugins=cfg.qgis_process_skip_plugins,
-                                       profile_args=profile)
+                                       profile_args=profile, priority=cfg.job_priority)
             self.step_render_check(project_path, runner, exports)
             self.check_cancel()
             plan = self.step_plan(work, exports, runner, jobs_n)

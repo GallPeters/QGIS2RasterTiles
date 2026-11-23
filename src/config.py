@@ -46,6 +46,9 @@ ADVANCED_DEFAULTS: Dict[str, Any] = {
     # feature id is exported and used as rendering order for layers that do
     # not already define "control feature rendering order".
     "preserve_feature_order": True,
+    # Priority of the rendering processes: "normal" or "below_normal". Below normal keeps the
+    # PC more responsive, but Windows may then run them on only a few cores.
+    "job_priority": "normal",
 }
 
 REQUIRED_KEYS = (
@@ -94,6 +97,7 @@ class TileConfig:
     qgis_process_skip_plugins: bool = True
     qgis_process_path: str = "auto"
     preserve_feature_order: bool = True
+    job_priority: str = "normal"
 
     def to_dict(self) -> Dict[str, Any]:
         """Plain dict (JSON-serialisable) of all settings."""
@@ -184,6 +188,7 @@ def validate_config(raw: Dict[str, Any]) -> TileConfig:
          and os.path.basename(v["output_filename"]) == v["output_filename"],
          "output_filename must be a plain file name ending in .gpkg")
     need(isinstance(v["qgis_process_path"], str), "qgis_process_path must be 'auto' or a path")
+    need(v["job_priority"] in ("normal", "below_normal"), "job_priority must be 'normal' or 'below_normal'")
     if errors:
         raise ConfigError("Invalid defaults.json:\n  - " + "\n  - ".join(errors))
 
