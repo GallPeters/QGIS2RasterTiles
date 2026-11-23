@@ -235,6 +235,12 @@ def available_memory_gb() -> Optional[float]:
         return None
 
 
+def usable_cores(cpu_percent: int = 100, cpu_count: Optional[int] = None) -> int:
+    """Logical processors the run may use: cpu_count x CPU usage limit (at least 1)."""
+    cpus = cpu_count if cpu_count is not None else (os.cpu_count() or 2)
+    return max(1, int(cpus * max(1, min(100, int(cpu_percent))) / 100))
+
+
 def resolve_max_parallel_jobs(cfg: TileConfig, cpu_count: Optional[int] = None,
                               mem_gb: Optional[float] = None, cpu_percent: int = 100) -> Tuple[int, str]:
     """Resolve the number of parallel qgis_process jobs; returns (jobs, explanation).

@@ -331,16 +331,59 @@ def _parse_json_output(text: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Pool
 # ---------------------------------------------------------------------------
-def run_jobs(specs: Sequence[JobSpec], runner: QgisProcessRunner, max_workers: int, manifest: Manifest,
+@dataclass
+class Concurrency:
+    """How many rendering processes run at once.
+
+    With ``adaptive`` the scheduler starts ``initial`` processes and then, every
+    ``interval_s``, samples the system-wide CPU utilisation:
+
+    * below ``cpu_target - 8`` (and enough free RAM, and jobs waiting): one more
+      process (two when far below), up to ``maximum``;
+    * above ``cpu_target + 3``: one fewer (applied when a job finishes; running
+      processes are never killed).
+
+    A single built-in run keeps only a few cores busy, so how many processes fill
+    the machine depends on the data and styles; measuring beats guessing.
+    """
+
+    initial: int
+    maximum: int
+    adaptive: bool = False
+    cpu_target: float = 95.0
+    ram_per_job_gb: float = 2.0
+    interval_s: float = 5.0
+    monitor: Any = None  # object with sample() -> Optional[float] and free_ram_gb() -> Optional[float]
+
+    @classmethod
+    def fixed(cls, n: int) -> "Concurrency":
+        return cls(max(1, n), max(1, n))
+
+
+def run_jobs(specs: Sequence[JobSpec], runner: QgisProcessRunner, concurrency, manifest: Manifest,
              is_canceled: Callable[[], bool], on_progress: Callable[[float], None],
              on_message: Callable[[str], None], retries: int = 1,
-             validate_output: Optional[Callable[[str], bool]] = None) -> List[JobResult]:
-    """Run jobs largest-workload-first on ``max_workers`` processes.
+             validate_output: Optional[Callable[[str], bool]] = None,
+             stats: Optional[Dict[str, Any]] = None) -> List[JobResult]:
+    """Run jobs largest-workload-first on parallel processes.
 
+    ``concurrency`` is a :class:`Concurrency` or a fixed number of processes.
     Callbacks are only invoked from the calling thread. Finished jobs found in
-    the manifest are skipped. Raises :class:`JobsCanceled` or
-    :class:`JobFailed` (after the other running jobs finished).
+    the manifest are skipped. ``stats`` (if given) receives ``peak_processes``
+    and ``avg_cpu``. Raises :class:`JobsCanceled` or :class:`JobFailed` (after
+    the other running jobs finished).
     """
+    cc = concurrency if isinstance(concurrency, Concurrency) else Concurrency.fixed(int(concurrency))
+    monitor = cc.monitor
+    if cc.adaptive and monitor is None:
+        from .sysload import CpuMonitor
+        monitor = CpuMonitor()
+    adaptive = cc.adaptive and monitor is not None and getattr(monitor, "available", True)
+    limit = max(1, min(cc.initial, cc.maximum))
+    peak = 0
+    cpu_samples: List[float] = []
+    last_tick = last_change = time.monotonic()
+    stats = stats if stats is not None else {}
     total = sum(s.workload for s in specs) or 1.0
     done_load = 0.0
     results: List[JobResult] = []
@@ -375,16 +418,22 @@ def run_jobs(specs: Sequence[JobSpec], runner: QgisProcessRunner, max_workers: i
             except queue.Empty:
                 return
 
-    pool = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix="pxyz-job")
-    futures: Dict[Future, JobSpec] = {}
+    # The threads only wait on their child process; the scheduler decides how many run.
+    pool = ThreadPoolExecutor(max_workers=max(1, cc.maximum), thread_name_prefix="pxyz-job")
+    running: Dict[Future, JobSpec] = {}
+    waiting = list(todo)  # largest first
     try:
-        for s in todo:  # submission order = largest first
-            futures[pool.submit(work, s)] = s
-        pending = set(futures)
-        while pending:
-            finished, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+        while waiting or running:
+            if not cancel.is_set():
+                while waiting and len(running) < limit:
+                    s = waiting.pop(0)
+                    running[pool.submit(work, s)] = s
+                peak = max(peak, len(running))
+            if not running:
+                break
+            finished, _ = wait(set(running), timeout=0.5, return_when=FIRST_COMPLETED)
             for f in finished:
-                spec = futures[f]
+                spec = running.pop(f)
                 try:
                     results.append(f.result())
                     done_load += spec.workload
@@ -398,13 +447,37 @@ def run_jobs(specs: Sequence[JobSpec], runner: QgisProcessRunner, max_workers: i
             if is_canceled() and not cancel.is_set():
                 on_message("Cancel requested: stopping running qgis_process jobs ...")
                 cancel.set()
-                for f in pending:
-                    f.cancel()
+                waiting.clear()
+
+            # --- adapt the number of processes to the measured CPU load ---------
+            now = time.monotonic()
+            if adaptive and not cancel.is_set() and now - last_tick >= cc.interval_s:
+                last_tick = now
+                u = monitor.sample()
+                if u is not None:
+                    cpu_samples.append(u)
+                    settled = now - last_change >= 2 * cc.interval_s  # let new processes ramp up first
+                    if settled and u < cc.cpu_target - 8 and waiting and limit < cc.maximum:
+                        ram = monitor.free_ram_gb()
+                        if ram is None or ram >= cc.ram_per_job_gb:
+                            step = 2 if u < cc.cpu_target - 30 else 1
+                            limit = min(cc.maximum, limit + step)
+                            last_change = now
+                            log.debug("CPU %.0f%%: up to %d parallel processes", u, limit)
+                        else:
+                            log.debug("CPU %.0f%% but only %.1f GB RAM free: keeping %d processes", u, ram, limit)
+                    elif settled and u > cc.cpu_target + 3 and limit > 1:
+                        limit -= 1
+                        last_change = now
+                        log.debug("CPU %.0f%%: down to %d parallel processes", u, limit)
         drain()
     finally:
         if is_canceled():
             cancel.set()
         pool.shutdown(wait=True, cancel_futures=True)
+    stats["peak_processes"] = peak
+    stats["avg_cpu"] = (sum(cpu_samples) / len(cpu_samples)) if cpu_samples else None
+    stats["adaptive"] = adaptive
     if is_canceled():
         raise JobsCanceled("canceled by user")
     if failures:

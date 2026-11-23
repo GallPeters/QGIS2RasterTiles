@@ -42,11 +42,12 @@ from qgis.core import (
 from qgis.PyQt.QtCore import QMetaType, Qt
 
 from .builtin_alg import ParameterMapping
-from .config import TileConfig, resolve_max_parallel_jobs
+from .config import TileConfig, available_memory_gb, resolve_max_parallel_jobs, usable_cores
 from .exporter import ExportError, export_layer
 from .field_analysis import analyze_layer_fields
 from .job_runner import (
-    JobFailed, JobSpec, JobsCanceled, Manifest, QgisProcessRunner, find_qgis_process, profile_arguments, run_jobs)
+    Concurrency, JobFailed, JobSpec, JobsCanceled, Manifest, QgisProcessRunner, find_qgis_process,
+    profile_arguments, run_jobs)
 from .merger import merge_parts, validate_part
 from .occupancy_scan import UNBOUNDED_RENDERERS, scan_other_layer, scan_vector_file
 from .partition import CostModel, Job, Occupancy, PartitionPlan, build_plan, choose_split_zoom
@@ -171,12 +172,18 @@ class Pipeline:
         (work / "logs").mkdir(parents=True, exist_ok=True)
         log.debug("Work directory: %s", work)
         log.debug(inp.mapping.describe())
-        jobs_n, why = resolve_max_parallel_jobs(cfg, cpu_percent=inp.cpu_percent)
+        conc, why = self.concurrency()
+        jobs_n = conc.maximum  # partition granularity: enough jobs for every process
         e = inp.extent
         log.debug("Output extent (%s): %r, %r, %r, %r; parallel processes: %s", inp.target_crs, e.xmin, e.ymin,
                   e.xmax, e.ymax, why)
-        log.info("Zooms %d-%d, %d layer(s), up to %d parallel processes", inp.zoom_min, inp.zoom_max,
-                 len(snap.render_order), jobs_n)
+        if conc.adaptive:
+            log.info("Zooms %d-%d, %d layer(s); parallel processes: %d to start, more while CPU < %.0f%% "
+                     "(up to %d)", inp.zoom_min, inp.zoom_max, len(snap.render_order), conc.initial,
+                     conc.cpu_target, conc.maximum)
+        else:
+            log.info("Zooms %d-%d, %d layer(s), %d parallel processes", inp.zoom_min, inp.zoom_max,
+                     len(snap.render_order), conc.maximum)
 
         # Step 1 -------------------------------------------------------------
         snap.adopt_layers()
@@ -237,13 +244,16 @@ class Pipeline:
             specs.append(JobSpec(j.job_id, inp.mapping.job_inputs(cfg, j.extent, inp.target_crs, j.zoom_min,
                                                                   j.zoom_max, out), out, j.workload + 1e-6))
         manifest = Manifest(work / "manifest.json", _sha(plan.to_dict()))
-        log.info("Rendering %d job(s) on %d parallel processes ...", len(specs), jobs_n)
-        results = run_jobs(specs, runner, jobs_n, manifest, self.canceled,
+        log.info("Rendering %d job(s) ...", len(specs))
+        run_stats: Dict[str, object] = {}
+        results = run_jobs(specs, runner, conc, manifest, self.canceled,
                            lambda f: self.progress(20, 75, f), lambda m: log.info("%s", m),
-                           retries=cfg.max_job_retries, validate_output=validate_part)
+                           retries=cfg.max_job_retries, validate_output=validate_part, stats=run_stats)
         self.timings["render"] = time.monotonic() - t0
         ran = [r for r in results if not r.skipped]
-        log.info("Rendering finished in %s", _duration(self.timings["render"]))
+        cpu = run_stats.get("avg_cpu")
+        log.info("Rendering finished in %s (up to %s parallel processes%s)", _duration(self.timings["render"]),
+                 run_stats.get("peak_processes", "?"), f", average CPU {cpu:.0f}%" if cpu is not None else "")
         if ran:
             log.debug("Sum of job times %.1fs", sum(r.seconds for r in ran))
 
@@ -289,6 +299,28 @@ class Pipeline:
                 "jobs": len(plan.jobs), "timings": dict(self.timings)}
 
     # ------------------------------------------------------------------
+    def concurrency(self) -> "tuple[Concurrency, str]":
+        """Number of parallel processes.
+
+        ``max_parallel_jobs: "auto"`` -> adaptive: start with half the usable
+        cores (``resolve_max_parallel_jobs``), add processes while the measured
+        CPU is below the target, up to one per usable core (and the RAM budget).
+        The target is the CPU usage limit, at most 95%.
+        An explicit number -> exactly that many (capped by the usable cores).
+        """
+        cfg, pct = self.cfg, self.inp.cpu_percent
+        initial, why = resolve_max_parallel_jobs(cfg, cpu_percent=pct)
+        if cfg.max_parallel_jobs != "auto":
+            return Concurrency.fixed(initial), why
+        maximum = usable_cores(pct)
+        mem = available_memory_gb()
+        if mem is not None:
+            maximum = min(maximum, max(1, int(mem // cfg.ram_per_job_gb)))
+        maximum = max(maximum, initial)
+        target = float(min(95, pct))
+        return (Concurrency(initial, maximum, adaptive=True, cpu_target=target, ram_per_job_gb=cfg.ram_per_job_gb),
+                f"{why}; adaptive up to {maximum} (CPU target {target:.0f}%)")
+
     def matrix_row(self, z: int):
         cols, rows = self.grid.matrix_size(z)
         px, py = self.grid.pixel_size(z)

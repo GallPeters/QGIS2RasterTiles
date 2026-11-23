@@ -33,7 +33,7 @@ Processing Toolbox → **QGIS2RasterTiles** → **Parallel XYZ tiles (GPKG)**
 |---|---|
 | Extent | area to tile |
 | Minimum / maximum zoom | 0–25 |
-| CPU usage limit (%) | share of the CPU cores to use |
+| CPU usage limit (%) | how much of the CPU to use (100 = keep it about 95% busy) |
 | Output directory | gets `tiles.gpkg` and a log file |
 
 Run it again with the same inputs to resume an interrupted run.
@@ -46,14 +46,14 @@ plus:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `max_parallel_jobs` | `auto` | parallel processes; `auto` = usable cores ÷ 2, limited by free RAM |
+| `max_parallel_jobs` | `auto` | parallel processes; `auto` starts with half the cores and adds more while the CPU is below the *CPU usage limit* (up to one per core, limited by free RAM); a number = fixed |
 | `split_zoom` | `auto` | zooms below it run as one job; zooms from it up are split into areas |
 | `edge_margin_px` | 100 | how far symbols and labels reach beyond their feature, in pixels |
 | `keep_temp_files` | false | keep the intermediate files |
 
 Tuning:
 
-- **Too slow, CPU not busy:** raise `max_parallel_jobs`.
+- **CPU too busy for other work:** lower the *CPU usage limit*; the number of processes follows it.
 - **Tiles missing at the edge of features:** raise `edge_margin_px`.
 - **Many tiny jobs at one zoom:** raise `split_zoom`.
 
