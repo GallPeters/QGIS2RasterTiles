@@ -361,10 +361,10 @@ def run_jobs(specs: Sequence[JobSpec], runner: QgisProcessRunner, max_workers: i
     failures: List[str] = []
 
     def work(spec: JobSpec) -> JobResult:
-        msgs.put(f"Job {spec.job_id} started")
+        log.debug("Job %s started", spec.job_id)
         r = runner.run(spec, cancel, retries)
         manifest.mark_done(spec.job_id, spec.output, r.seconds)
-        msgs.put(f"Job {spec.job_id} finished in {r.seconds:.1f}s"
+        log.debug(f"Job {spec.job_id} finished in {r.seconds:.1f}s"
                  + (f" (after {r.attempts} attempts)" if r.attempts > 1 else ""))
         return r
 

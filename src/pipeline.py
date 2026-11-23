@@ -81,6 +81,16 @@ class PipelineInputs:
     settings_dir: str = ""  # QgsApplication.qgisSettingsDirPath() of the running QGIS (its user profile)
 
 
+def _duration(seconds: float) -> str:
+    """Human-readable duration (e.g. '45s', '12m 05s', '3h 07m')."""
+    s = int(round(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
+
 def _sha(obj) -> str:
     return hashlib.sha1(json.dumps(obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
@@ -159,42 +169,45 @@ class Pipeline:
         (work / "export").mkdir(parents=True, exist_ok=True)
         (work / "parts").mkdir(parents=True, exist_ok=True)
         (work / "logs").mkdir(parents=True, exist_ok=True)
-        log.info("Work directory: %s", work)
-        log.info(inp.mapping.describe())
+        log.debug("Work directory: %s", work)
+        log.debug(inp.mapping.describe())
         jobs_n, why = resolve_max_parallel_jobs(cfg, cpu_percent=inp.cpu_percent)
-        log.info("Parallel jobs: %d (%s)", jobs_n, why)
         e = inp.extent
-        log.info("Output extent (%s): %r, %r, %r, %r; zooms %d-%d", inp.target_crs, e.xmin, e.ymin, e.xmax, e.ymax,
-                 inp.zoom_min, inp.zoom_max)
+        log.debug("Output extent (%s): %r, %r, %r, %r; parallel processes: %s", inp.target_crs, e.xmin, e.ymin,
+                  e.xmax, e.ymax, why)
+        log.info("Zooms %d-%d, %d layer(s), up to %d parallel processes", inp.zoom_min, inp.zoom_max,
+                 len(snap.render_order), jobs_n)
 
         # Step 1 -------------------------------------------------------------
         snap.adopt_layers()
         try:
             for w in snap.warnings:
                 log.warning(w)
-            log.info("Step 1: %d visible layer(s) in drawing order: %s", len(snap.render_order),
-                     ", ".join(snap.layers[i].name() for i in snap.render_order))
+            log.debug("Visible layers in drawing order: %s",
+                      ", ".join(snap.layers[i].name() for i in snap.render_order))
 
             # Steps 2+3 ------------------------------------------------------
             t0 = time.monotonic()
             exports, order_fields = self.step_export(work)
             self.timings["export"] = time.monotonic() - t0
+            log.info("Exported %d features from %d layer(s) in %.0fs (only used fields, filters applied)",
+                     sum(v["count"] for v in exports.values()), len(exports), self.timings["export"])
 
             # Step 4 ---------------------------------------------------------
             t0 = time.monotonic()
             project_path = str(work / "render.qgz")
             marker = work / "project.json"
             if _read_json(marker) == {"ok": True} and os.path.isfile(project_path):
-                log.info("Step 4: reusing render project %s", project_path)
+                log.debug("Reusing render project %s", project_path)
             else:
                 rep = build_render_project(snap, {k: (v["path"], v["count"]) for k, v in exports.items()},
                                            self.crs, project_path, order_fields)
                 for c in rep.checks:
-                    log.info("  verify: %s", c)
+                    log.debug("  verify: %s", c)
                 for w in rep.warnings:
                     log.warning(w)
                 _write_json(marker, {"ok": True})
-                log.info("Step 4: render project saved: %s", project_path)
+                log.debug("Render project saved: %s", project_path)
             self.timings["project"] = time.monotonic() - t0
             self.progress(15, 2, 1)
             self.check_cancel()
@@ -202,9 +215,9 @@ class Pipeline:
             # Step 5 ---------------------------------------------------------
             t0 = time.monotonic()
             qp = find_qgis_process(inp.qgis_prefix, inp.qgis_version, cfg.qgis_process_path)
-            log.info("qgis_process: %s", qp)
+            log.debug("qgis_process: %s", qp)
             profile = profile_arguments(inp.settings_dir) if inp.settings_dir else []
-            log.info("qgis_process user profile: %s", " ".join(profile[1:2]) or "(qgis_process default)")
+            log.debug("qgis_process user profile: %s", " ".join(profile[1:2]) or "(qgis_process default)")
             runner = QgisProcessRunner(qp, inp.mapping.algorithm_id, project_path, work / "logs",
                                        ellipsoid=snap.ellipsoid or None, skip_plugins=cfg.qgis_process_skip_plugins,
                                        profile_args=profile)
@@ -224,15 +237,15 @@ class Pipeline:
             specs.append(JobSpec(j.job_id, inp.mapping.job_inputs(cfg, j.extent, inp.target_crs, j.zoom_min,
                                                                   j.zoom_max, out), out, j.workload + 1e-6))
         manifest = Manifest(work / "manifest.json", _sha(plan.to_dict()))
-        log.info("Step 6: running %d job(s) on %d parallel qgis_process worker(s) ...", len(specs), jobs_n)
+        log.info("Rendering %d job(s) on %d parallel processes ...", len(specs), jobs_n)
         results = run_jobs(specs, runner, jobs_n, manifest, self.canceled,
-                           lambda f: self.progress(20, 75, f), lambda m: log.info("  %s", m),
+                           lambda f: self.progress(20, 75, f), lambda m: log.info("%s", m),
                            retries=cfg.max_job_retries, validate_output=validate_part)
         self.timings["render"] = time.monotonic() - t0
         ran = [r for r in results if not r.skipped]
+        log.info("Rendering finished in %s", _duration(self.timings["render"]))
         if ran:
-            log.info("Rendering finished in %.1fs (sum of job times %.1fs)", self.timings["render"],
-                     sum(r.seconds for r in ran))
+            log.debug("Sum of job times %.1fs", sum(r.seconds for r in ran))
 
         # Step 7 -------------------------------------------------------------
         t0 = time.monotonic()
@@ -241,21 +254,20 @@ class Pipeline:
                   [j.job_id for j in plan.jobs if j.tile_range is not None]
         parts = [by_id[i] for i in ordered]
         final = str(out_dir / cfg.output_filename)
-        log.info("Step 7: merging %d part(s) into %s", len(parts), final)
+        log.info("Merging %d part(s) ...", len(parts))
         report = merge_parts(parts, final, (e.xmin, e.ymin, e.xmax, e.ymax), inp.zoom_min, inp.zoom_max,
                              self.matrix_row, vacuum=cfg.vacuum,
                              progress=lambda f: self.progress(95, 5, f), is_canceled=self.canceled)
         self.timings["merge"] = time.monotonic() - t0
         for z in range(inp.zoom_min, inp.zoom_max + 1):
-            log.info("  zoom %2d: %d tiles", z, report.tiles_per_zoom.get(z, 0))
-        log.info("Merged %d tiles, integrity_check=%s, table '%s'", report.total_tiles, report.integrity,
-                 report.tile_table)
-        log.info("Feature accounting (all checks passed, no feature lost):")
+            log.debug("  zoom %2d: %d tiles", z, report.tiles_per_zoom.get(z, 0))
+        log.debug("integrity_check=%s, table '%s'", report.integrity, report.tile_table)
+        log.debug("Feature accounting (all checks passed, no feature lost):")
         for v in exports.values():
-            log.info("  %s: %d after layer filter = %d in render area + %d entirely outside it; %d exported "
-                     "(ids verified) = %d in the saved render project; %d without geometry",
-                     v.get("name", "?"), v.get("source_count", -1), v["count"], v.get("outside_area", 0),
-                     v["count"], v["count"], v.get("null_geometry", 0))
+            log.debug("  %s: %d after layer filter = %d in render area + %d entirely outside it; %d exported "
+                      "(ids verified) = %d in the saved render project; %d without geometry",
+                      v.get("name", "?"), v.get("source_count", -1), v["count"], v.get("outside_area", 0),
+                      v["count"], v["count"], v.get("null_geometry", 0))
 
         if not cfg.keep_temp_files:
             shutil.rmtree(work, ignore_errors=True)
@@ -266,7 +278,12 @@ class Pipeline:
         else:
             log.info("Temporary files kept in %s", work)
         self.timings["total"] = time.monotonic() - t_all
-        log.info("Timings (s): " + ", ".join(f"{k}={v:.1f}" for k, v in self.timings.items()))
+        log.debug("Timings (s): " + ", ".join(f"{k}={v:.1f}" for k, v in self.timings.items()))
+        outside = sum(v.get("outside_area", 0) for v in exports.values())
+        log.info("Feature check passed: all %d features in the render area were exported and rendered%s",
+                 sum(v["count"] for v in exports.values()),
+                 f" ({outside} lie entirely outside it)" if outside else "")
+        log.info("Done in %s: %d tiles -> %s", _duration(self.timings["total"]), report.total_tiles, final)
         self.progress(100, 0, 1)
         return {"output": final, "tiles": report.total_tiles, "per_zoom": report.tiles_per_zoom,
                 "jobs": len(plan.jobs), "timings": dict(self.timings)}
@@ -283,11 +300,11 @@ class Pipeline:
         prev = _read_json(marker)
         if prev and all(os.path.isfile(v["path"]) for v in prev["exports"].values()) and \
                 set(prev["exports"]) == set(snap.vector_ids()):
-            log.info("Steps 2-3: reusing %d exported layer(s)", len(prev["exports"]))
+            log.info("Resuming: reusing %d exported layer(s)", len(prev["exports"]))
             return prev["exports"], prev["order_fields"]
 
         filter_rect = self.export_filter_rect()
-        log.info("Steps 2-3: export filter (target CRS): %s",
+        log.debug("Steps 2-3: export filter (target CRS): %s",
                  filter_rect.toString(6) if filter_rect is not None else "none (whole matrix is rendered)")
         exports: Dict[str, dict] = {}
         order_fields: Dict[str, str] = {}
@@ -307,9 +324,9 @@ class Pipeline:
             analysis.required.append(id_name)
             if self.cfg.preserve_feature_order and r is not None and not r.orderByEnabled():
                 order_fields[lid] = id_name
-            log.info("  %s", analysis.summary(layer.fields().count()))
+            log.debug("  %s", analysis.summary(layer.fields().count()))
             if layer.subsetString():
-                log.info("  %s: layer filter: %s", layer.name(), layer.subsetString())
+                log.debug("  %s: layer filter: %s", layer.name(), layer.subsetString())
             out = str(work / "export" / f"layer{n:03d}.fgb")
             base, span = 15 * n / max(1, len(ids)), 15 / max(1, len(ids))
             fb = _SubFeedback(self.feedback, base, span)
@@ -318,7 +335,7 @@ class Pipeline:
             self.check_cancel()
             for note in res.notes:
                 log.warning("  %s: %s", layer.name(), note)
-            log.info("  %s: features after layer filter %d -> inside render area %d (%d entirely outside it, "
+            log.debug("  %s: features after layer filter %d -> inside render area %d (%d entirely outside it, "
                      "not drawn by any tile) -> exported %d (%d without geometry) in %.1fs",
                      layer.name(), res.source_count, res.expected_count, res.outside_area, res.exported_count,
                      res.null_geometry, time.monotonic() - t0)
@@ -369,7 +386,7 @@ class Pipeline:
                 if x.get("renderer") != exports[lid]["renderer"]:
                     raise PipelineError(f"{x['name']}: renderer '{x.get('renderer')}' in the saved render project, "
                                         f"'{exports[lid]['renderer']}' in the original")
-        log.info("Render check: saved project reloaded, %d layer(s) valid, feature counts match the export",
+        log.debug("Render check: saved project reloaded, %d layer(s) valid, feature counts match the export",
                  len(seen))
 
     def step_plan(self, work: Path, exports: Dict[str, dict], runner: QgisProcessRunner, jobs_n: int) -> PartitionPlan:
@@ -378,14 +395,14 @@ class Pipeline:
         prev = _read_json(plan_path)
         if prev:
             plan = PartitionPlan.from_dict(prev)
-            log.info("Step 5: reusing plan with %d job(s)", len(plan.jobs))
+            log.info("Resuming: reusing the plan with %d job(s)", len(plan.jobs))
             return plan
 
         total_features = sum(v["count"] for v in exports.values())
         split = cfg.split_zoom if cfg.split_zoom != "auto" else choose_split_zoom(
             self.grid, inp.extent, inp.zoom_min, inp.zoom_max, cfg.split_tile_threshold)
         split = max(split, inp.zoom_min)
-        log.info("Step 5: split zoom = %d (%s)", split, "auto" if cfg.split_zoom == "auto" else "defaults.json")
+        log.debug("Step 5: split zoom = %d (%s)", split, "auto" if cfg.split_zoom == "auto" else "defaults.json")
 
         startup = 0.0
         if split <= inp.zoom_max:
@@ -414,16 +431,16 @@ class Pipeline:
                     n = scan_vector_file(info["path"], occ, self.canceled)
                     self.check_cancel()
                     with_geom = info["count"] - info.get("null_geometry", 0)
-                    log.info("  occupancy: %s, %d of %d features with geometry scanned in %.1fs", lyr.name(), n,
+                    log.debug("  occupancy: %s, %d of %d features with geometry scanned in %.1fs", lyr.name(), n,
                              with_geom, time.monotonic() - t0)
                     if n != with_geom:
                         raise PipelineError(f"{lyr.name()}: occupancy scanned {n} features but {with_geom} exported "
                                             f"features have a geometry")
                 else:
                     scan_other_layer(lyr, occ, self.crs, snap.transform_context)
-                    log.info("  occupancy: %s (not vector) marks its whole extent", lyr.name())
+                    log.debug("  occupancy: %s (not vector) marks its whole extent", lyr.name())
         elif split <= inp.zoom_max:
-            log.info("skip_empty_tiles is false: every block is rendered (no occupancy skipping)")
+            log.debug("skip_empty_tiles is false: every block is rendered (no occupancy skipping)")
 
         plan = build_plan(self.grid, inp.extent, inp.zoom_min, inp.zoom_max, cfg.metatile_size, split, occ, cm,
                           jobs_n, total_features)
@@ -437,20 +454,20 @@ class Pipeline:
             verify_coverage(occ, plan)
         s = plan.stats
         if plan.split_zoom > inp.zoom_max:
-            log.info("Plan: 1 job over the full extent (no zoom exceeds the split threshold); %d metatiles; "
-                     "estimated %.0fs", s["planned_metatiles"], s["estimated_serial_s"])
+            log.info("Plan: 1 job over the full extent (small area, nothing to split)")
+            log.debug("%d metatiles, estimated %.0fs", s["planned_metatiles"], s["estimated_serial_s"])
             _write_json(plan_path, plan.to_dict())
             return plan
-        log.info("Plan: %d job(s); partitioned zooms %d-%d: %d of %d metatiles occupied; "
-                 "metatiles to render %d of %d (single run) -> %.1f%% of the work skipped as empty; "
-                 "estimated %.0fs serial, %.0fs with %d worker(s) (job start-up %.1fs)",
-                 s["jobs"], plan.split_zoom, inp.zoom_max, s["partitioned_metatiles_occupied"],
-                 s["partitioned_metatiles_total"], s["planned_metatiles"], s["total_metatiles"],
-                 100 * s["work_saved_share"], s["estimated_serial_s"], s["estimated_makespan_s"], jobs_n, startup)
+        log.info("Plan: %d job(s); %.0f%% of the map is empty and skipped", s["jobs"], 100 * s["work_saved_share"])
+        log.debug("Partitioned zooms %d-%d: %d of %d metatiles occupied; metatiles to render %d of %d (single run); "
+                  "estimated %.0fs serial, %.0fs with %d worker(s) (job start-up %.1fs)",
+                  plan.split_zoom, inp.zoom_max, s["partitioned_metatiles_occupied"],
+                  s["partitioned_metatiles_total"], s["planned_metatiles"], s["total_metatiles"],
+                  s["estimated_serial_s"], s["estimated_makespan_s"], jobs_n, startup)
         for z in range(plan.split_zoom, inp.zoom_max + 1):
             zj = [j for j in plan.jobs if j.tile_range is not None and j.zoom_min == z]
             if zj:
-                log.info("  zoom %2d: %d job(s), %d metatiles", z, len(zj), sum(j.metatiles for j in zj))
+                log.debug("  zoom %2d: %d job(s), %d metatiles", z, len(zj), sum(j.metatiles for j in zj))
         _write_json(plan_path, plan.to_dict())
         return plan
 
@@ -475,7 +492,7 @@ class Pipeline:
         except JobFailed as e:
             raise PipelineError(f"the built-in algorithm failed on a one-tile test job: {e}") from e
         secs = time.monotonic() - t0
-        log.info("Measured qgis_process start-up + project load: %.1fs", secs)
+        log.debug("Measured qgis_process start-up + project load: %.1fs", secs)
         _write_json(cache, {"seconds": secs})
         for suffix in ("", "-wal", "-shm"):
             if os.path.exists(out + suffix):
@@ -501,7 +518,7 @@ def verify_coverage(occ: Occupancy, plan: PartitionPlan) -> None:
             covered = sum((b[1] - b[0] + 1) * (b[3] - b[2] + 1) for b in boxes)
             if covered < g.count:
                 raise PipelineError(f"zoom {z}: jobs cover {covered} of {g.count} metatiles")
-            log.info("  coverage zoom %2d: all %d metatiles rendered by %d job(s)", z, g.count, len(jobs))
+            log.debug("  coverage zoom %2d: all %d metatiles rendered by %d job(s)", z, g.count, len(jobs))
             continue
         by_col: Dict[int, List] = {}  # metatile column -> row intervals of the jobs covering it
         for i0, i1, j0, j1 in boxes:
@@ -511,7 +528,7 @@ def verify_coverage(occ: Occupancy, plan: PartitionPlan) -> None:
         if lost:
             raise PipelineError(f"zoom {z}: {len(lost)} occupied metatile(s) are not covered by any job, "
                                 f"e.g. {lost[:5]}")
-        log.info("  coverage zoom %2d: all %d occupied metatiles rendered by %d job(s)", z, len(zo.cells), len(jobs))
+        log.debug("  coverage zoom %2d: all %d occupied metatiles rendered by %d job(s)", z, len(zo.cells), len(jobs))
 
 
 def _has_geometry_generator(layer: QgsVectorLayer) -> bool:
