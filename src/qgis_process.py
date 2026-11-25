@@ -1,7 +1,7 @@
-"""Run the built-in algorithm in qgis_process at high priority.
+"""Run the built-in algorithm in qgis_process at normal priority.
 
 Used by both tile generation methods: one process ("Built-in tool") or many
-("Parallel workers", see :mod:`job_runner`). Every process starts at HIGH
+("Parallel workers", see :mod:`job_runner`). Every process starts at NORMAL
 priority on Windows (no window); on Linux the priority is left unchanged.
 """
 
@@ -17,12 +17,12 @@ from typing import Any, Dict, List, Optional
 
 IS_WINDOWS = sys.platform == "win32"
 CREATE_NO_WINDOW = 0x08000000
-HIGH_PRIORITY_CLASS = 0x00000080
+NORMAL_PRIORITY_CLASS = 0x00000020
 
 
 def popen_options() -> Dict[str, Any]:
-    """subprocess options: high priority, no console window (Windows)."""
-    return {"creationflags": CREATE_NO_WINDOW | HIGH_PRIORITY_CLASS} if IS_WINDOWS else {}
+    """subprocess options: normal priority, no console window (Windows)."""
+    return {"creationflags": CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS} if IS_WINDOWS else {}
 
 
 def find_qgis_process(prefix_path: str) -> str:

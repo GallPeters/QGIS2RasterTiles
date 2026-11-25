@@ -3,8 +3,8 @@ name=QGIS2RasterTiles
 qgisMinimumVersion=4.3
 qgisMaximumVersion=4.99
 supportsQt6=True
-description=Generate XYZ raster tiles into a GeoPackage faster: the built-in tool on a lean local copy of the project, at high priority, as one process or as parallel workers.
-about=Packages the visible layers into one GeoPackage, copies the project and points it to the package (filters and unused fields removed), then runs the built-in "Generate XYZ tiles (GeoPackage)" at high priority: once, or as several parallel workers that skip empty areas (verified: no overlap, no gap). Also merges tile GeoPackages (e.g. zooms 0-18 and 19). Requires QGIS 4.3 or later.
+description=Generate XYZ raster tiles into a GeoPackage faster: the built-in tool on a lean local copy of the project, at normal priority, as one process or as parallel workers.
+about=Packages the visible layers into one GeoPackage, copies the project and points it to the package (filters and unused fields removed), then runs the built-in "Generate XYZ tiles (GeoPackage)" at normal priority: once, or as several parallel workers that skip empty areas (verified: no overlap, no gap). Also merges tile GeoPackages (e.g. zooms 0-18 and 19). Requires QGIS 4.3 or later.
 version=0.3
 author=Jossef Kanter
 email=jossefkan@gmail.com
@@ -16,6 +16,6 @@ icon=icon.png
 experimental=True
 deprecated=False
 hasProcessingProvider=yes
-changelog=0.3 - New "Tile generation method": built-in tool or parallel workers (plan and parts verified: no overlap, no gap). All processes at high priority.
+changelog=0.3 - New "Tile generation method": built-in tool or parallel workers (plan and parts verified: no overlap, no gap). All processes at normal priority.
     0.2 - Simpler: built-in tools only (Package Layers + Generate XYZ tiles) run at normal priority; no parallel workers.
     0.1 - First public release.

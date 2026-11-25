@@ -77,7 +77,7 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self) -> str:  # noqa: N802
         return self.tr(
             "Runs the built-in 'Generate XYZ tiles (GeoPackage)' on a lean local copy of the project, "
-            "at high priority.\n\n"
+            "at normal priority.\n\n"
             "Steps: Package Layers (visible vector layers, filtered, in the target CRS) - copy the project - "
             "point its layers to the package - remove filters and unused fields - generate the tiles.\n\n"
             "Tile generation method: 'Built-in tool' runs it once. 'Parallel workers' runs several copies "
@@ -186,7 +186,7 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(f"3/4 Project copy uses the GeoPackage; filters removed; "
                           f"{dropped} unused field(s) removed, {kept} kept")
 
-        # 6. Generate XYZ tiles (GeoPackage): one process or parallel workers, high priority
+        # 6. Generate XYZ tiles (GeoPackage): one process or parallel workers, normal priority
         steps.setCurrentStep(3)
         os.makedirs(self.out_dir, exist_ok=True)
         output = os.path.join(self.out_dir, OUTPUT_NAME)
@@ -203,12 +203,12 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
         try:
             if self.method == 0:
                 feedback.pushInfo(f"4/4 {self.xyz.displayName()}: zooms {self.zoom_min}-{self.zoom_max}, "
-                                  f"one process, high priority")
+                                  f"one process, normal priority")
                 qgis_process.run(make_args(self.extent_rect, self.zoom_min, self.zoom_max, output),
                                  os.path.join(self.temp, "qgis_process.log"), steps, self.cpu_percent)
             else:
                 feedback.pushInfo(f"4/4 {self.xyz.displayName()}: zooms {self.zoom_min}-{self.zoom_max}, "
-                                  f"parallel workers, high priority")
+                                  f"parallel workers, normal priority")
                 run_parallel(xyz=self.xyz, defaults=self.defaults, crs_authid=self.crs.authid(),
                              extent=self.extent_rect, zmin=self.zoom_min, zmax=self.zoom_max, make_args=make_args,
                              sources=sources, counts=counts, renderers=renderers, has_non_vector=self.non_vector,

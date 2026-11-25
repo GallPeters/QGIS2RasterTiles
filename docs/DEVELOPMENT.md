@@ -9,7 +9,7 @@
 | `src/merge_algorithm.py`, `src/merger.py` | *Merge XYZ tiles (GPKG)* |
 | `src/field_analysis.py` | fields a layer's style uses |
 | `src/builtin_alg.py` | finds `native:tilesxyzgpkg`, reads and checks `defaults.json` |
-| `src/qgis_process.py` | runs `qgis_process` at high priority (progress, cancel, CPU limit) |
+| `src/qgis_process.py` | runs `qgis_process` at normal priority (progress, cancel, CPU limit) |
 | `src/parallel.py`, `src/partition.py`, `src/tile_grid.py`, `src/occupancy_scan.py`, `src/job_runner.py`, `src/sysload.py` | the *Parallel workers* method: occupancy, plan, verification, adaptive process pool |
 | `tests/` | QGIS and plain-Python tests, integration comparisons |
 | `tools/build_release.py` | builds `releases/QGIS2RasterTiles-<version>.zip` |
@@ -21,7 +21,7 @@
 3. **Point the copy's layers** to the packaged tables (`setDataSource`, style kept). The copy is read without resolving its original sources, so the original data is not opened again.
 4. **Remove filters**, joins and virtual fields: their values are real columns in the package.
 5. **Remove unused fields** from the package (`field_analysis.py`).
-6. **Run the built-in tool** on the copy at high priority, with the `defaults.json` values and the user's extent and zooms:
+6. **Run the built-in tool** on the copy at normal priority, with the `defaults.json` values and the user's extent and zooms:
    - *Built-in tool*: one `qgis_process`.
    - *Parallel workers* (`parallel.py`): two probe jobs measure the job start-up and the cost of an empty metatile; the plan has full-extent jobs for cheap low zooms and, per zoom, rectangles of the single run's own metatiles where there are features. `verify_plan` proves every metatile is in exactly one job and every job extent selects exactly its tiles; `verify_parts` checks each part after rendering; the merge must find zero duplicates; the result must open in GDAL with every zoom level.
 

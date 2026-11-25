@@ -11,7 +11,7 @@
 ## Why
 
 QGIS's *Generate XYZ tiles (GeoPackage)* keeps only a few CPU cores busy and renders every metatile, even empty ones.
-QGIS2RasterTiles runs the same tool on a lean local copy of your project, at high priority, either once or as several parallel workers.
+QGIS2RasterTiles runs the same tool on a lean local copy of your project, at normal priority, either once or as several parallel workers.
 The tiles are the built-in tool's own output.
 
 ## How it works
@@ -20,7 +20,7 @@ The tiles are the built-in tool's own output.
 2. **Copy** the project into a temp folder.
 3. **Point** the copy's layers to the GeoPackage.
 4. **Remove** the layer filters and the fields the styles don't use.
-5. **Run** *Generate XYZ tiles (GeoPackage)* on the copy, at high priority, with the chosen method:
+5. **Run** *Generate XYZ tiles (GeoPackage)* on the copy, at normal priority, with the chosen method:
    - **Built-in tool:** one process.
    - **Parallel workers:** several processes at once, each on its own part of the map, only where there are features.
      Before rendering, the plan is checked: every metatile is in exactly one job (no overlap, no gap).
