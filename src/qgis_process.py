@@ -1,10 +1,8 @@
-"""Run one algorithm in qgis_process at normal priority.
+"""Run the built-in algorithm in qgis_process at high priority.
 
-Inside QGIS, Processing algorithms run in a background task, and their
-rendering threads may get a low priority; on some CPUs Windows then keeps them
-on a few cores. Running the built-in algorithm in its own qgis_process at
-normal priority lets it use the whole machine. This module only starts that
-one process, reports its progress, and stops it on cancel.
+Used by both tile generation methods: one process ("Built-in tool") or many
+("Parallel workers", see :mod:`job_runner`). Every process starts at HIGH
+priority on Windows (no window); on Linux the priority is left unchanged.
 """
 
 from __future__ import annotations
@@ -15,18 +13,22 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 IS_WINDOWS = sys.platform == "win32"
 CREATE_NO_WINDOW = 0x08000000
-NORMAL_PRIORITY_CLASS = 0x00000020
+HIGH_PRIORITY_CLASS = 0x00000080
+
+
+def popen_options() -> Dict[str, Any]:
+    """subprocess options: high priority, no console window (Windows)."""
+    return {"creationflags": CREATE_NO_WINDOW | HIGH_PRIORITY_CLASS} if IS_WINDOWS else {}
 
 
 def find_qgis_process(prefix_path: str) -> str:
     """The qgis_process executable of the running QGIS (same build as the GUI)."""
     prefix = Path(prefix_path)
-    names = ["qgis_process.exe"] if IS_WINDOWS else ["qgis_process"]
-    candidates = [prefix / "bin" / n for n in names]
+    candidates = [prefix / "bin" / ("qgis_process.exe" if IS_WINDOWS else "qgis_process")]
     if IS_WINDOWS:  # OSGeo4W / standalone launchers: <root>/bin/qgis_process-<build>.bat
         candidates.append(prefix.parent.parent / "bin" / f"qgis_process-{prefix.name}.bat")
     for c in candidates:
@@ -50,6 +52,20 @@ def last_percent(text: str) -> Optional[int]:
     return int(found[-1]) if found else None
 
 
+def kill(proc: subprocess.Popen) -> None:
+    """Kill a process and its children."""
+    if proc.poll() is not None:
+        return
+    if IS_WINDOWS:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True,
+                       creationflags=CREATE_NO_WINDOW)
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    proc.wait()
+
+
 def _set_cpu_limit(proc: subprocess.Popen, cpu_percent: int) -> None:
     """Restrict the process to the first N logical processors (N = cpu_count x cpu_percent)."""
     cpus = os.cpu_count() or 1
@@ -66,30 +82,20 @@ def _set_cpu_limit(proc: subprocess.Popen, cpu_percent: int) -> None:
         pass
 
 
-def _kill(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    if IS_WINDOWS:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True,
-                       creationflags=CREATE_NO_WINDOW)
-    proc.kill()
-    proc.wait()
-
-
 def run(args: List[str], log_path: str, feedback, cpu_percent: int = 100) -> None:
-    """Run qgis_process with ``args`` at normal priority; progress and cancel via ``feedback``.
+    """Run one qgis_process (built-in method); progress and cancel via ``feedback``.
 
     Output goes to ``log_path``. Raises RuntimeError on failure or cancel.
     """
-    kw = {"creationflags": CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS} if IS_WINDOWS else {}
     with open(log_path, "w", encoding="utf-8", errors="replace") as log:
         log.write("command: " + " ".join(args) + "\n\n")
         log.flush()
-        proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kw)
+        proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                **popen_options())
         _set_cpu_limit(proc, cpu_percent)
         while proc.poll() is None:
             if feedback.isCanceled():
-                _kill(proc)
+                kill(proc)
                 raise RuntimeError("canceled")
             time.sleep(1)
             try:

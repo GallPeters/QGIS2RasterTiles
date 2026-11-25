@@ -30,6 +30,7 @@ from qgis.core import (
     QgsProcessingMultiStepFeedback,
     QgsProcessingOutputFile,
     QgsProcessingOutputNumber,
+    QgsProcessingParameterEnum,
     QgsProcessingParameterExtent,
     QgsProcessingParameterFolderDestination,
     QgsProcessingParameterNumber,
@@ -43,6 +44,9 @@ from qgis.PyQt.QtCore import QCoreApplication
 from . import qgis_process
 from .builtin_alg import ConfigError, as_argument, find_xyz_gpkg_algorithm, load_defaults
 from .field_analysis import analyze_layer_fields
+from .job_runner import JobsCanceled
+from .parallel import run_parallel
+from .tile_grid import Rect
 
 OUTPUT_NAME = "tiles.gpkg"
 
@@ -52,7 +56,9 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
     ZOOM_MIN = "ZOOM_MIN"
     ZOOM_MAX = "ZOOM_MAX"
     CPU_PERCENT = "CPU_PERCENT"
+    METHOD = "METHOD"
     OUTPUT_DIR = "OUTPUT_DIR"
+    METHODS = ["Built-in tool (one process)", "Parallel workers (several processes, empty areas skipped)"]
     OUTPUT_FILE = "OUTPUT_FILE"
     TILE_COUNT = "TILE_COUNT"
 
@@ -71,9 +77,12 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self) -> str:  # noqa: N802
         return self.tr(
             "Runs the built-in 'Generate XYZ tiles (GeoPackage)' on a lean local copy of the project, "
-            "at normal priority so it can use all CPU cores.\n\n"
+            "at high priority.\n\n"
             "Steps: Package Layers (visible vector layers, filtered, in the target CRS) - copy the project - "
             "point its layers to the package - remove filters and unused fields - generate the tiles.\n\n"
+            "Tile generation method: 'Built-in tool' runs it once. 'Parallel workers' runs several copies "
+            "at once, each on its own part of the map, and only where there are features; the parts are "
+            "verified (no overlap, no gap) and merged into one GeoPackage.\n\n"
             "Fixed tile settings are in defaults.json in the plugin folder. The result is "
             f"'{OUTPUT_NAME}' in the output directory.")
 
@@ -86,6 +95,8 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(
             self.CPU_PERCENT, self.tr("CPU usage limit (%)"), Qgis.ProcessingNumberParameterType.Integer,
             100, False, 1, 100))
+        self.addParameter(QgsProcessingParameterEnum(
+            self.METHOD, self.tr("Tile generation method"), [self.tr(m) for m in self.METHODS], defaultValue=0))
         self.addParameter(QgsProcessingParameterFolderDestination(self.OUTPUT_DIR, self.tr("Output directory")))
         self.addOutput(QgsProcessingOutputFile(self.OUTPUT_FILE, self.tr("Tiles GeoPackage")))
         self.addOutput(QgsProcessingOutputNumber(self.TILE_COUNT, self.tr("Number of tiles")))
@@ -129,6 +140,9 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
         self.zoom_min = self.parameterAsInt(parameters, self.ZOOM_MIN, context)
         self.zoom_max = self.parameterAsInt(parameters, self.ZOOM_MAX, context)
         self.cpu_percent = self.parameterAsInt(parameters, self.CPU_PERCENT, context)
+        self.method = self.parameterAsEnum(parameters, self.METHOD, context)
+        self.extent_rect = Rect(rect.xMinimum(), rect.yMinimum(), rect.xMaximum(), rect.yMaximum())
+        self.non_vector = len(self.visible_ids) != len(self.vector_ids)
         self.out_dir = self.parameterAsString(parameters, self.OUTPUT_DIR, context)
         self.ellipsoid = project.ellipsoid()
         self.prefix = QgsApplication.prefixPath()
@@ -159,7 +173,7 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
             raise QgsProcessingException("Package Layers did not return one table per layer "
                                          "(do two layers have the same name?)")
         sources = dict(zip(self.vector_ids, uris))
-        total = check_feature_counts(context.project(), sources)
+        total, counts = check_feature_counts(context.project(), sources)
         feedback.pushInfo(f"   packaged {total} features, none lost")
         if steps.isCanceled():
             return {}
@@ -168,29 +182,42 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
         steps.setCurrentStep(1)
         feedback.pushInfo("2/4 Project copied")
         steps.setCurrentStep(2)
-        kept, dropped = prepare_project_copy(self.project_copy, sources, self.visible_ids)
+        kept, dropped, renderers = prepare_project_copy(self.project_copy, sources, self.visible_ids)
         feedback.pushInfo(f"3/4 Project copy uses the GeoPackage; filters removed; "
                           f"{dropped} unused field(s) removed, {kept} kept")
 
-        # 6. the built-in tool, normal priority
+        # 6. Generate XYZ tiles (GeoPackage): one process or parallel workers, high priority
         steps.setCurrentStep(3)
         os.makedirs(self.out_dir, exist_ok=True)
         output = os.path.join(self.out_dir, OUTPUT_NAME)
-        args = [qgis_process.find_qgis_process(self.prefix)] + qgis_process.profile_arguments(self.settings_dir)
-        args += ["run", self.xyz.id(), f"--PROJECT_PATH={self.project_copy}"]
+        base = [qgis_process.find_qgis_process(self.prefix)] + qgis_process.profile_arguments(self.settings_dir)
+        base += ["run", self.xyz.id(), f"--PROJECT_PATH={self.project_copy}"]
         if self.ellipsoid and self.ellipsoid.upper() != "NONE":
-            args.append(f"--ELLIPSOID={self.ellipsoid}")
-        args += [f"--EXTENT={self.extent}", f"--ZOOM_MIN={self.zoom_min}", f"--ZOOM_MAX={self.zoom_max}",
-                 f"--OUTPUT_FILE={output}"]
-        args += [f"--{k}={as_argument(v)}" for k, v in self.defaults.items()]
-        feedback.pushInfo(f"4/4 {self.xyz.displayName()}: zooms {self.zoom_min}-{self.zoom_max}, normal priority")
+            base.append(f"--ELLIPSOID={self.ellipsoid}")
+        fixed = [f"--{k}={as_argument(v)}" for k, v in self.defaults.items()]
+
+        def make_args(rect: Rect, zmin: int, zmax: int, out: str) -> List[str]:
+            ext = f"{rect.xmin!r},{rect.xmax!r},{rect.ymin!r},{rect.ymax!r} [{self.crs.authid()}]"
+            return base + [f"--EXTENT={ext}", f"--ZOOM_MIN={zmin}", f"--ZOOM_MAX={zmax}", f"--OUTPUT_FILE={out}"] + fixed
+
         try:
-            qgis_process.run(args, os.path.join(self.temp, "qgis_process.log"), steps, self.cpu_percent)
-        except RuntimeError as e:
+            if self.method == 0:
+                feedback.pushInfo(f"4/4 {self.xyz.displayName()}: zooms {self.zoom_min}-{self.zoom_max}, "
+                                  f"one process, high priority")
+                qgis_process.run(make_args(self.extent_rect, self.zoom_min, self.zoom_max, output),
+                                 os.path.join(self.temp, "qgis_process.log"), steps, self.cpu_percent)
+            else:
+                feedback.pushInfo(f"4/4 {self.xyz.displayName()}: zooms {self.zoom_min}-{self.zoom_max}, "
+                                  f"parallel workers, high priority")
+                run_parallel(xyz=self.xyz, defaults=self.defaults, crs_authid=self.crs.authid(),
+                             extent=self.extent_rect, zmin=self.zoom_min, zmax=self.zoom_max, make_args=make_args,
+                             sources=sources, counts=counts, renderers=renderers, has_non_vector=self.non_vector,
+                             output=output, work=self.temp, cpu_percent=self.cpu_percent, feedback=steps,
+                             info=feedback.pushInfo)
+        except (RuntimeError, JobsCanceled) as e:
             if feedback.isCanceled():
                 return {}
             raise QgsProcessingException(str(e)) from e
-
         con = sqlite3.connect(output)
         tiles = con.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
         con.close()
@@ -212,9 +239,12 @@ def write_project_copy(project: QgsProject, path: str) -> None:
         project.setDirty(dirty)
 
 
-def check_feature_counts(project: QgsProject, sources: Dict[str, str]) -> int:
-    """Packaged features per layer must equal the layer's features (its filter applied)."""
-    total = 0
+def check_feature_counts(project: QgsProject, sources: Dict[str, str]) -> tuple:
+    """Packaged features per layer must equal the layer's features (its filter applied).
+
+    Returns (total, {layer id: packaged count}).
+    """
+    total, counts = 0, {}
     for lid, uri in sources.items():
         src = project.mapLayer(lid)
         out = QgsVectorLayer(uri, "check", "ogr")
@@ -226,17 +256,19 @@ def check_feature_counts(project: QgsProject, sources: Dict[str, str]) -> int:
         if expected >= 0 and n != expected:
             raise QgsProcessingException(f"'{src.name()}': {expected} features in the project, {n} packaged")
         total += n
-    return total
+        counts[lid] = n
+    return total, counts
 
 
 def prepare_project_copy(path: str, sources: Dict[str, str], visible_ids: List[str]) -> tuple:
     """Steps 3-5 on the saved copy: GeoPackage sources, no filters, only used fields.
 
     The copy is read without resolving its original data sources, so the original
-    data is not opened again. Returns (fields kept, fields removed).
+    data is not opened again. Returns (fields kept, fields removed, {layer id: renderer type}).
     """
     p = QgsProject()
     kept = dropped = 0
+    renderers: Dict[str, str] = {}
     try:
         if not p.read(path, Qgis.ProjectReadFlag.DontResolveLayers):
             raise QgsProcessingException(f"Cannot read the project copy: {p.error()}")
@@ -264,9 +296,10 @@ def prepare_project_copy(path: str, sources: Dict[str, str], visible_ids: List[s
                 lyr.updateFields()
             dropped += len(unused)
             kept += fields.count() - len(unused)
+            renderers[lid] = lyr.renderer().type() if lyr.renderer() else ""
         p.setFilePathStorage(Qgis.FilePathType.Absolute)
         if not p.write(path):
             raise QgsProcessingException(f"Cannot save the project copy: {p.error()}")
     finally:
         p.clear()
-    return kept, dropped
+    return kept, dropped, renderers

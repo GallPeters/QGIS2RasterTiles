@@ -10,8 +10,8 @@
 
 ## Why
 
-QGIS's *Generate XYZ tiles (GeoPackage)* can end up running at low priority, and Windows may then keep it on a few cores.
-QGIS2RasterTiles runs the same tool on a lean local copy of your project, in its own process at normal priority.
+QGIS's *Generate XYZ tiles (GeoPackage)* keeps only a few CPU cores busy and renders every metatile, even empty ones.
+QGIS2RasterTiles runs the same tool on a lean local copy of your project, at high priority, either once or as several parallel workers.
 The tiles are the built-in tool's own output.
 
 ## How it works
@@ -20,7 +20,11 @@ The tiles are the built-in tool's own output.
 2. **Copy** the project into a temp folder.
 3. **Point** the copy's layers to the GeoPackage.
 4. **Remove** the layer filters and the fields the styles don't use.
-5. **Run** *Generate XYZ tiles (GeoPackage)* on the copy, at normal priority.
+5. **Run** *Generate XYZ tiles (GeoPackage)* on the copy, at high priority, with the chosen method:
+   - **Built-in tool:** one process.
+   - **Parallel workers:** several processes at once, each on its own part of the map, only where there are features.
+     Before rendering, the plan is checked: every metatile is in exactly one job (no overlap, no gap).
+     After rendering, each part is checked to hold only its own tiles, the parts are merged with zero duplicates allowed, and the result must open in GDAL with every zoom level.
 
 ## Requirements
 
@@ -37,6 +41,7 @@ Processing Toolbox → **QGIS2RasterTiles**
 | Extent | area to tile |
 | Minimum / maximum zoom | 0–25 |
 | CPU usage limit (%) | share of the CPU cores to use |
+| Tile generation method | *Built-in tool* (one process) or *Parallel workers* (faster, especially for sparse data) |
 | Output directory | gets `tiles.gpkg` |
 
 **Merge XYZ tiles (GPKG)** merges tile GeoPackages into one, e.g. a zooms 0–18 result and a zoom 19 result.

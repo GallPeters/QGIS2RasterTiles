@@ -140,13 +140,16 @@ class ProjectCopy(unittest.TestCase):
         res = processing.run("native:package", {"LAYERS": ids, "OUTPUT": pkg, "OVERWRITE": True, "SAVE_STYLES": True,
                                                 "CRS": "EPSG:4326"}, context=ctx, feedback=QgsProcessingFeedback())
         sources = dict(zip(ids, res["OUTPUT_LAYERS"]))
-        self.assertEqual(check_feature_counts(project, sources), 342 + 12 + 2)  # poi filter applied
+        total, counts = check_feature_counts(project, sources)
+        self.assertEqual(total, 342 + 12 + 2)  # poi filter applied
+        self.assertEqual(sorted(counts.values()), [2, 12, 342])
 
         copy = os.path.join(tmp.name, "copy.qgz")
         name = project.fileName()
         write_project_copy(project, copy)
         self.assertEqual(project.fileName(), name)  # the open project is unchanged
-        kept, dropped = prepare_project_copy(copy, sources, ids)
+        kept, dropped, renderers = prepare_project_copy(copy, sources, ids)
+        self.assertEqual(sorted(renderers.values()), ["RuleRenderer", "categorizedSymbol", "singleSymbol"])
         self.assertGreater(dropped, 0)
         project.clear()
 

@@ -69,6 +69,7 @@ def main() -> int:
     ap.add_argument("--zmin", type=int, default=12)
     ap.add_argument("--zmax", type=int, default=17)
     ap.add_argument("--extent", default="34.70,34.90,31.98,32.18", help="xmin,xmax,ymin,ymax in EPSG:4326")
+    ap.add_argument("--method", type=int, default=0, help="0 = built-in tool, 1 = parallel workers")
     a = ap.parse_args()
     shutil.rmtree(a.out, ignore_errors=True)
     project_path = build_test_project(os.path.join(a.out, "src"))
@@ -102,7 +103,7 @@ def main() -> int:
     print(f"[plugin] zooms {a.zmin}-{a.zmax} ...", flush=True)
     t0 = time.monotonic()
     res, ok = reg.algorithmById("qgis2rastertiles:xyztilesgpkg").run(
-        {"EXTENT": extent, "ZOOM_MIN": a.zmin, "ZOOM_MAX": a.zmax, "CPU_PERCENT": 100,
+        {"EXTENT": extent, "ZOOM_MIN": a.zmin, "ZOOM_MAX": a.zmax, "CPU_PERCENT": 100, "METHOD": a.method,
          "OUTPUT_DIR": os.path.join(a.out, "plugin")}, ctx, Fb())
     t_plugin = time.monotonic() - t0
     stop.set()
