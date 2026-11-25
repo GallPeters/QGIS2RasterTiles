@@ -129,7 +129,7 @@ class MergeToolTest(unittest.TestCase):
         with open(self.p("a.gpkg"), "rb") as fh:
             before = fh.read()
         rep = merge_tile_geopackages([self.p("a.gpkg"), self.p("b.gpkg")], self.p("out.gpkg"))
-        self.assertEqual(rep.tiles_per_zoom, {10: 1, 11: 1, 12: 1, 15: 2})
+        self.assertEqual(rep.tiles_per_zoom, {10: 1, 11: 1, 12: 1, 13: 1, 14: 1, 15: 2})  # 13-14: filler tiles
         con = sqlite3.connect(self.p("out.gpkg"))
         rows = {r[0]: r[1:] for r in con.execute(
             "SELECT zoom_level, matrix_width, matrix_height, pixel_x_size FROM gpkg_tile_matrix")}
@@ -157,6 +157,23 @@ class MergeToolTest(unittest.TestCase):
         self.assertEqual(con.execute("SELECT tile_data FROM tiles WHERE tile_column=1").fetchone()[0], b"img12_1_1")
         con.close()
 
+    def test_real_tile_replaces_filler(self):
+        from src.merger import fill_empty_zooms, filler_tile, merge_tile_geopackages
+        make_part(self.p("low.gpkg"), [(10, 1, 1)], [10, 11, 12], bounds=(-180, -90, 180, 90))
+        self.assertEqual(fill_empty_zooms(self.p("low.gpkg"), 10, 12), [11, 12])
+        con = sqlite3.connect(self.p("low.gpkg"))
+        col, row = con.execute("SELECT tile_column, tile_row FROM tiles WHERE zoom_level=12").fetchone()
+        con.close()
+        self.assertEqual((col, row), (4096, 2048))  # centre of the extent
+        make_part(self.p("high.gpkg"), [(12, col, row), (12, 5, 5)], [12])
+        rep = merge_tile_geopackages([self.p("low.gpkg"), self.p("high.gpkg")], self.p("out.gpkg"))
+        con = sqlite3.connect(self.p("out.gpkg"))
+        tiles = {r[:3]: r[3] for r in con.execute("SELECT zoom_level, tile_column, tile_row, tile_data FROM tiles")}
+        con.close()
+        self.assertEqual(tiles[(12, col, row)], b"img12_%d_%d" % (col, row))  # the real tile, not the filler
+        self.assertEqual(tiles[(11, 2048, 1024)], filler_tile())  # zoom 11 still has only its filler
+        self.assertEqual(rep.tiles_per_zoom, {10: 1, 11: 1, 12: 2})
+
     def test_rejects_bad_inputs(self):
         from src.merger import merge_tile_geopackages
         make_part(self.p("a.gpkg"), [(12, 1, 1)], [12])
@@ -169,6 +186,42 @@ class MergeToolTest(unittest.TestCase):
             fh.write(b"not a database")
         with self.assertRaisesRegex(MergeError, "not a tile GeoPackage"):
             merge_tile_geopackages([self.p("a.gpkg"), self.p("junk.gpkg")], self.p("out.gpkg"))
+
+
+class FillEmptyZoomsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "t.gpkg")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fills_only_empty_zooms_and_adds_matrix_rows(self):
+        from src.merger import fill_empty_zooms, filler_tile
+        make_part(self.path, [(17, 5, 5), (18, 10, 10)], [17, 18], bounds=(34.2, 29.45, 35.95, 33.35))
+        self.assertEqual(fill_empty_zooms(self.path, 0, 18), list(range(0, 17)))
+        con = sqlite3.connect(self.path)
+        per = dict(con.execute("SELECT zoom_level, COUNT(*) FROM tiles GROUP BY 1"))
+        self.assertEqual(per, {z: 1 for z in range(17)} | {17: 1, 18: 1})
+        self.assertEqual([r[0] for r in con.execute("SELECT zoom_level FROM gpkg_tile_matrix ORDER BY 1")],
+                         list(range(19)))
+        n = 2 ** 13 / 360  # zoom 12: tiles per degree in the 2x1 scheme
+        self.assertEqual(con.execute("SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level=12").fetchone(),
+                         (int((35.075 + 180) * n), int((90 - 31.4) * n), filler_tile()))
+        con.close()
+        self.assertEqual(fill_empty_zooms(self.path, 0, 18), [])  # idempotent
+
+    def test_filler_is_a_valid_transparent_png(self):
+        import struct
+        import zlib
+        from src.merger import filler_tile
+        png = filler_tile(256, 256)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(struct.unpack(">IIBB", png[16:26]), (256, 256, 8, 6))  # 8-bit RGBA
+        idat_len = struct.unpack(">I", png[33:37])[0]
+        raw = zlib.decompress(png[41:41 + idat_len])
+        self.assertEqual(raw, (b"\x00" * (1 + 4 * 256)) * 256)
+        self.assertEqual(filler_tile(), png)
 
 
 if __name__ == "__main__":

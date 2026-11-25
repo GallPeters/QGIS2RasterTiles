@@ -13,6 +13,8 @@ import math
 import os
 import shutil
 import sqlite3
+import struct
+import zlib
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -101,6 +103,64 @@ def tiles_per_zoom(path: str) -> Dict[int, int]:
         con.close()
 
 
+def filler_tile(width: int = 256, height: int = 256) -> bytes:
+    """A fully transparent PNG tile, byte-for-byte the same on every run (it is recognised by its bytes)."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    raw = (b"\x00" + b"\x00" * (4 * width)) * height
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def fill_empty_zooms(path: str, zoom_min: int, zoom_max: int) -> List[int]:
+    """Give every zoom in ``zoom_min..zoom_max`` without tiles one transparent tile.
+
+    GDAL (and so QGIS and ArcGIS Pro) offers only zoom levels that contain tiles as
+    overviews. When the layers draw only at the highest zooms, the file would have no
+    coarse level, and viewers read millions of tiles to show the whole area or to
+    compute statistics (QGIS freezes while adding the layer). One transparent tile per
+    empty zoom gives every level. Missing gpkg_tile_matrix rows are derived from the
+    nearest zoom; filler tiles at zooms that do have real tiles are removed.
+    Returns the zooms that got a filler tile.
+    """
+    con = sqlite3.connect(path, isolation_level=None)
+    try:
+        table = tile_table_name(con)
+        mx = _matrices(con, "main", table)
+        if not mx:
+            return []
+        _, sx, sy, ex, ey = _matrix_set(con, "main", table)
+        b = con.execute("SELECT min_x, min_y, max_x, max_y FROM gpkg_contents WHERE table_name=?", (table,)).fetchone()
+        cx, cy = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) if b and None not in b else ((sx + ex) / 2, (sy + ey) / 2)
+        have = {z for (z,) in con.execute(f"SELECT DISTINCT zoom_level FROM {_qi(table)}")}
+        con.execute("BEGIN")
+        filled = []
+        for z in range(zoom_min, zoom_max + 1):
+            if z not in mx:
+                k = min(mx, key=lambda m: abs(m - z))
+                w, h, tw, th, px, py = mx[k]
+                f = 2.0 ** (z - k)
+                mx[z] = (int(round(w * f)), int(round(h * f)), tw, th, px / f, py / f)
+                con.execute("INSERT INTO gpkg_tile_matrix (table_name, zoom_level, matrix_width, matrix_height, "
+                            "tile_width, tile_height, pixel_x_size, pixel_y_size) VALUES (?,?,?,?,?,?,?,?)",
+                            (table, z, *mx[z]))
+            w, h, tw, th, _, _ = mx[z]
+            blob = filler_tile(tw, th)
+            if z in have:
+                con.execute(f"DELETE FROM {_qi(table)} WHERE zoom_level=? AND tile_data=? AND "
+                            f"(SELECT COUNT(*) FROM {_qi(table)} WHERE zoom_level=?) > 1", (z, blob, z))
+                continue
+            col = min(w - 1, max(0, int((cx - sx) / ((ex - sx) / w))))
+            row = min(h - 1, max(0, int((ey - cy) / ((ey - sy) / h))))
+            con.execute(f"INSERT INTO {_qi(table)} (zoom_level, tile_column, tile_row, tile_data) VALUES (?,?,?,?)",
+                        (z, col, row, blob))
+            filled.append(z)
+        con.execute("COMMIT")
+        return filled
+    finally:
+        con.close()
+
+
 def validate_part(path: str) -> bool:
     """True if ``path`` is a readable GeoPackage with one tiles table."""
     if not os.path.isfile(path):
@@ -151,6 +211,7 @@ def merge_parts(parts: Sequence[str], output: str, full_extent: Tuple[float, flo
 
     con = sqlite3.connect(output, isolation_level=None)
     ignored = 0
+    replaced: Dict[int, int] = {}
     try:
         con.execute("PRAGMA journal_mode=DELETE")
         con.execute("PRAGMA synchronous=OFF")
@@ -177,6 +238,13 @@ def merge_parts(parts: Sequence[str], output: str, full_extent: Tuple[float, flo
                         raise MergeError(f"gpkg_tile_matrix for zoom {z} differs in {p}: {row} vs {base_matrices[z]}")
                 part_count = con.execute(f"SELECT COUNT(*) FROM part.{_qi(ptable)}").fetchone()[0]
                 con.execute("BEGIN")
+                # a real tile of this part replaces a transparent filler tile (fill_empty_zooms) of the base
+                for z, (_, _, tw, th, _, _) in pm.items():
+                    for (zz,) in con.execute(
+                            f"DELETE FROM main.{_qi(table)} WHERE zoom_level=? AND tile_data=? AND "
+                            f"(tile_column, tile_row) IN (SELECT tile_column, tile_row FROM part.{_qi(ptable)} "
+                            f"WHERE zoom_level=?) RETURNING zoom_level", (z, filler_tile(tw, th), z)).fetchall():
+                        replaced[zz] = replaced.get(zz, 0) + 1
                 cur = con.execute(
                     f"INSERT OR IGNORE INTO main.{_qi(table)} (zoom_level, tile_column, tile_row, tile_data) "
                     f"SELECT zoom_level, tile_column, tile_row, tile_data FROM part.{_qi(ptable)}")
@@ -221,6 +289,8 @@ def merge_parts(parts: Sequence[str], output: str, full_extent: Tuple[float, flo
 
     if integrity != "ok":
         raise MergeError(f"PRAGMA integrity_check failed on {output}: {integrity}")
+    for z, n in replaced.items():
+        expected[z] -= n
     report = MergeReport(output, table, per_zoom, expected, ignored, integrity)
     if ignored == 0:
         for z in sorted(set(expected) | set(per_zoom)):
@@ -279,5 +349,8 @@ def merge_tile_geopackages(inputs: Sequence[str], output: str, vacuum: bool = Fa
         f = 2.0 ** (z - k)
         return int(round(w * f)), int(round(h * f)), tw, th, px / f, py / f
 
-    return merge_parts(inputs, out_abs, tuple(bounds), min(matrices), max(matrices), matrix_row,
-                       vacuum=vacuum, progress=progress, expect_duplicates=True, is_canceled=is_canceled)
+    report = merge_parts(inputs, out_abs, tuple(bounds), min(matrices), max(matrices), matrix_row,
+                         vacuum=vacuum, progress=progress, expect_duplicates=True, is_canceled=is_canceled)
+    fill_empty_zooms(out_abs, min(matrices), max(matrices))  # drops fillers next to real tiles, fills gaps
+    report.tiles_per_zoom = tiles_per_zoom(out_abs)
+    return report

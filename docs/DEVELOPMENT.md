@@ -25,6 +25,8 @@
    - *Built-in tool*: one `qgis_process`.
    - *Parallel workers* (`parallel.py`): two probe jobs measure the job start-up and the cost of an empty metatile; the plan has full-extent jobs for cheap low zooms and, per zoom, rectangles of the single run's own metatiles where there are features. `verify_plan` proves every metatile is in exactly one job and every job extent selects exactly its tiles; `verify_parts` checks each part after rendering; the merge must find zero duplicates; the result must open in GDAL with every zoom level.
 
+7. **Fill empty zooms** (`merger.fill_empty_zooms`, both methods and the merge tool): every requested zoom without tiles gets one transparent PNG tile (fixed bytes) at the centre of the extent, so GDAL exposes every zoom as an overview. Without it, a file with tiles only at zooms 17-18 makes QGIS read every zoom 17 tile position to compute band statistics while adding the layer. The merge tool replaces a filler tile with a real tile from another input. `check_output` then requires tiles at every zoom.
+
 The built-in tool anchors metatiles at the first tile of the requested range at every zoom, so partitioned jobs cover one zoom each and start on the single run's metatile origins: tiles are identical to one run.
 
 Hidden layers are removed from the copy; visible non-vector layers keep their original source.

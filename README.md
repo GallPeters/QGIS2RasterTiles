@@ -25,6 +25,8 @@ The tiles are the built-in tool's own output.
    - **Parallel workers:** several processes at once, each on its own part of the map, only where there are features.
      Before rendering, the plan is checked: every metatile is in exactly one job (no overlap, no gap).
      After rendering, each part is checked to hold only its own tiles, the parts are merged with zero duplicates allowed, and the result must open in GDAL with every zoom level.
+6. **Fill empty zooms:** a zoom where nothing is drawn (e.g. layers visible only at large scales) gets one transparent tile.
+   Viewers such as QGIS and ArcGIS Pro only see zoom levels that contain tiles; without coarse levels they read millions of tiles to show the whole area, and QGIS freezes while adding the layer.
 
 ## Requirements
 

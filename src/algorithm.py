@@ -45,8 +45,20 @@ from . import qgis_process
 from .builtin_alg import ConfigError, as_argument, find_xyz_gpkg_algorithm, load_defaults
 from .field_analysis import analyze_layer_fields
 from .job_runner import JobsCanceled
-from .parallel import run_parallel
+from .merger import fill_empty_zooms
+from .parallel import check_output, run_parallel
 from .tile_grid import Rect
+
+
+def format_zooms(zooms: List[int]) -> str:
+    """[0, 1, 2, 5, 7, 8] -> '0-2, 5, 7-8'."""
+    runs: List[List[int]] = []
+    for z in sorted(zooms):
+        if runs and z == runs[-1][1] + 1:
+            runs[-1][1] = z
+        else:
+            runs.append([z, z])
+    return ", ".join(f"{a}-{b}" if a != b else f"{a}" for a, b in runs)
 
 OUTPUT_NAME = "tiles.gpkg"
 
@@ -217,6 +229,14 @@ class XyzTilesAlgorithm(QgsProcessingAlgorithm):
         except (RuntimeError, JobsCanceled) as e:
             if feedback.isCanceled():
                 return {}
+            raise QgsProcessingException(str(e)) from e
+        try:
+            filled = fill_empty_zooms(output, self.zoom_min, self.zoom_max)
+            if filled:
+                feedback.pushInfo(f"   zooms {format_zooms(filled)}: nothing drawn; one transparent tile each, "
+                                  f"so viewers can show the whole area quickly")
+            check_output(output, self.zoom_min, self.zoom_max)
+        except (RuntimeError, sqlite3.Error) as e:
             raise QgsProcessingException(str(e)) from e
         con = sqlite3.connect(output)
         tiles = con.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]

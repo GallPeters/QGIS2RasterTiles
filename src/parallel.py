@@ -137,7 +137,6 @@ def run_parallel(*, xyz, defaults: Dict[str, Any], crs_authid: str, extent: Rect
                       is_canceled=feedback.isCanceled)
     if rep.ignored_duplicates:
         raise PlanError(f"{rep.ignored_duplicates} tiles were rendered by two jobs")
-    check_output(output, zmin, zmax)
     return {"jobs": len(plan.jobs), "tiles": rep.total_tiles}
 
 
@@ -160,7 +159,8 @@ def _empty_block(occ: Optional[Occupancy], size: int = 16):
 
 
 def check_output(path: str, zmin: int, zmax: int) -> None:
-    """The merged GeoPackage must open in GDAL and be readable over its whole extent.
+    """The output GeoPackage must open in GDAL, be readable over its whole extent and
+    have tiles at every zoom (see merger.fill_empty_zooms), so viewers use coarse levels.
 
     (GDAL leaves out zoom levels where the whole area is smaller than a tile, so the
     number of overviews is not a fixed function of the zoom range.)
@@ -180,3 +180,10 @@ def check_output(path: str, zmin: int, zmax: int) -> None:
         con.close()
     if zooms != list(range(zmin, zmax + 1)):
         raise PlanError(f"the output's tile matrix has zooms {zooms}, expected {zmin}-{zmax}")
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        with_tiles = [r[0] for r in con.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY 1")]
+    finally:
+        con.close()
+    if with_tiles != list(range(zmin, zmax + 1)):
+        raise PlanError(f"the output has tiles at zooms {with_tiles}, expected {zmin}-{zmax}")
