@@ -5,47 +5,40 @@
 | Path | Contents |
 |---|---|
 | `__init__.py`, `metadata.txt`, `defaults.json`, `icon.*` | plugin root (the repository root is the plugin folder) |
-| `src/` | plugin code |
-| `tests/` | unit, QGIS and integration tests |
+| `src/algorithm.py` | *Generate XYZ tiles (GPKG) - full speed* |
+| `src/merge_algorithm.py`, `src/merger.py` | *Merge XYZ tiles (GPKG)* |
+| `src/field_analysis.py` | fields a layer's style uses |
+| `src/builtin_alg.py` | finds `native:tilesxyzgpkg`, reads and checks `defaults.json` |
+| `src/qgis_process.py` | runs one `qgis_process` at normal priority (progress, cancel, CPU limit) |
+| `tests/` | QGIS and plain-Python tests, integration comparisons |
 | `tools/build_release.py` | builds `releases/QGIS2RasterTiles-<version>.zip` |
 
-## Pipeline (`src/pipeline.py`)
+## Steps (`src/algorithm.py`)
 
-1. **Snapshot** (main thread): visible layers in drawing order, cloned and detached from the main thread; tree, groups and project settings.
-2. **Fields** (`field_analysis.py`): fields used by renderer, labels, data-defined properties, diagrams; all fields if an expression does not parse.
-3. **Export** (`exporter.py`): FlatGeobuf per layer: used fields + `$id`, layer filter applied, render area + margin, reprojected.
-4. **Render project** (`project_builder.py`): new `.qgz`, same tree, layer ids and styles (QML), absolute resource paths.
-5. **Plan** (`partition.py`, `occupancy_scan.py`): from `split_zoom` on, blocks of the single run's own metatiles that contain features; below it, full-extent jobs (cheap zooms grouped, heavy zooms cut into blocks). Two probe jobs first measure the job start-up and the cost of an empty metatile; a block is split only when that is cheaper than one more start-up.
-6. **Jobs** (`job_runner.py`): `qgis_process run native:tilesxyzgpkg -` in parallel, normal priority (`job_priority`), same user profile, retry, resume manifest. With `max_parallel_jobs: "auto"` the scheduler starts half the usable cores and samples system CPU (`sysload.py`) every 5 s: below the target it adds processes (up to one per usable core, if RAM allows), above it lets the count shrink as jobs finish.
-7. **Merge** (`merger.py`; the same code backs the *Merge XYZ tiles (GPKG)* tool, `merge_algorithm.py`): `ATTACH` + `INSERT OR IGNORE`, tile-matrix check, integrity check.
+1. **Package Layers** (`native:package`): visible vector layers, in render order, to one GeoPackage in `TARGET_CRS`; layer filters applied; styles saved. Feature counts are checked against the layers.
+2. **Copy the project** to the temp folder (absolute paths) without changing the open project.
+3. **Point the copy's layers** to the packaged tables (`setDataSource`, style kept). The copy is read without resolving its original sources, so the original data is not opened again.
+4. **Remove filters**, joins and virtual fields: their values are real columns in the package.
+5. **Remove unused fields** from the package (`field_analysis.py`).
+6. **Run the built-in tool** on the copy in one `qgis_process` at normal priority, with the `defaults.json` values and the user's extent and zooms.
 
-The built-in algorithm anchors metatiles at the first tile of the requested range at every zoom. Partitioned jobs therefore cover one zoom each and start on the single run's metatile origins, which keeps tiles identical.
-
-## Feature accounting
-
-The run stops if any count does not match:
-
-- source ids (layer filter applied) inside the render area equal the exported ids;
-- the saved render project, reloaded from disk, has the exported counts;
-- every exported feature with a geometry is scanned for occupancy;
-- every occupied metatile is inside a job.
-
-Features entirely outside the render area are reported; no tile shows them, in the built-in tool either.
+Hidden layers are removed from the copy; visible non-vector layers keep their original source.
 
 ## Tests
 
-Plain Python, no QGIS needed:
+Plain Python:
 
-    python -m unittest discover -s tests -p "test_*.py"
+    python -m unittest discover -s tests -p "test_merge.py"
 
 QGIS, on Windows with OSGeo4W:
 
     cd tests
     python-qgis-dev.bat -m unittest test_qgis_components -v
 
-Built-in vs plugin (tile keys, pixels, timing):
+Plugin vs built-in (tile bytes, timing, priority of the rendering process):
 
-    python-qgis-dev.bat tests/integration_compare.py --zmin 12 --zmax 18 --extent 34.70,31.98,34.90,32.18
+    python-qgis-dev.bat tests/integration_compare.py --zmin 12 --zmax 19
+    python-qgis-dev.bat tests/integration_merge.py
 
 ## Release
 

@@ -212,10 +212,3 @@ def build_test_project(folder: str, n_points: int = 400, seed: int = 3) -> str:
     assert project.write(path), project.error()
     project.clear()
     return path
-
-
-def qgis_process_path() -> str:
-    """qgis_process launcher of the running QGIS (for tests)."""
-    from qgis.core import Qgis as _Q
-    from src.job_runner import find_qgis_process
-    return str(find_qgis_process(QgsApplication.prefixPath(), _Q.version()))
